@@ -1,0 +1,4 @@
+.env.local
+exports**/
+__pycache__/
+.venv/

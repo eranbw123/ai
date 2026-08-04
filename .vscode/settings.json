@@ -1,0 +1,10 @@
+{
+    "workbench.notifications.showInTitleBar": false,
+    "zenMode.silentNotifications": false,
+    "accessibility.signals.chatResponseReceived": {
+        "sound": "off"
+    },
+    "accessibility.signals.chatUserActionRequired": {
+        "sound": "off"
+    }
+}

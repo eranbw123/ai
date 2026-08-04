@@ -1,0 +1,119 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "claude_export_cdp: list (May 5-10)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/claude_export_cdp.py",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "list",
+                "--after", "2026-05-05",
+                "--before", "2026-05-10",
+                "--date-field", "created"
+            ]
+        },
+        {
+            "name": "claude_export_cdp: export-all (May 5-10, markdown)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/claude_export_cdp.py",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "export-all",
+                "--format", "markdown",
+                "--after", "2026-05-05",
+                "--before", "2026-05-10",
+                "--date-field", "created",
+                "--out", "${workspaceFolder}/exports_may5-10"
+            ]
+        },
+        {
+            "name": "claude_export_cdp: export-all (custom args)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/claude_export_cdp.py",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": "${input:pickArgs}"
+        },
+        {
+            "name": "test_claude_export",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/test_claude_export.py",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "chatgpt_export_cdp: list (May 5-10)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/chatgpt_export_cdp.py",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "list",
+                "--after", "2026-05-05",
+                "--before", "2026-05-10",
+                "--date-field", "created"
+            ]
+        },
+        {
+            "name": "chatgpt_export_cdp: export-all (May 5-10, markdown)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/chatgpt_export_cdp.py",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": [
+                "export-all",
+                "--format", "markdown",
+                "--after", "2026-05-05",
+                "--before", "2026-05-10",
+                "--date-field", "created",
+                "--out", "${workspaceFolder}/exports_chatgpt_may5-10"
+            ]
+        },
+        {
+            "name": "chatgpt_export_cdp: export-all (custom args)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/chatgpt_export_cdp.py",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": "${input:pickArgsChatgpt}"
+        },
+        {
+            "name": "test_chatgpt_export",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/test_chatgpt_export.py",
+            "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ],
+    "inputs": [
+        {
+            "id": "pickArgs",
+            "type": "promptString",
+            "description": "Args for claude_export_cdp.py, e.g.: export-all --format text --after 2026-01-01 --before 2026-02-01"
+        },
+        {
+            "id": "pickArgsChatgpt",
+            "type": "promptString",
+            "description": "Args for chatgpt_export_cdp.py, e.g.: export-all --format text --after 2026-01-01 --before 2026-02-01"
+        }
+    ]
+}
