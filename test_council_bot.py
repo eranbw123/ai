@@ -58,6 +58,21 @@ class TestLoadContext(unittest.TestCase):
         finally:
             path.unlink()
 
+    def test_context_file_pointing_at_directory_globs_within_it(self):
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+            tmp = Path(tmp)
+            (tmp / "a.md").write_text("scoped md content", encoding="utf-8")
+            (tmp / "b.txt").write_text("scoped txt content", encoding="utf-8")
+            (tmp / "c.json").write_text("{}", encoding="utf-8")  # ignored pattern
+
+            with patch.dict("os.environ", {"COUNCIL_CONTEXT_FILE": str(tmp)}):
+                text, n_files = load_context()
+
+            self.assertEqual(n_files, 2)
+            self.assertIn("scoped md content", text)
+            self.assertIn("scoped txt content", text)
+            self.assertNotIn("{}", text)
+
     def test_globs_exports_dirs_relative_to_repo_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)

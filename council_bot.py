@@ -118,13 +118,26 @@ list — sized to fit a phone screen>\
 
 
 def load_context():
-    # POC scoping: point at a single export file instead of globbing all of
-    # them (useful while testing generation time against a small context).
-    single_file = os.environ.get("COUNCIL_CONTEXT_FILE")
-    if single_file:
-        path = Path(single_file)
+    # POC scoping: point at a single export file or a single exports*/
+    # subdirectory instead of globbing all of them (useful to scope context
+    # down -- e.g. to just the last couple of days -- without touching the
+    # full export history under exports*/).
+    scoped = os.environ.get("COUNCIL_CONTEXT_FILE")
+    if scoped:
+        path = Path(scoped)
         if not path.is_absolute():
             path = REPO_ROOT / path
+        if path.is_dir():
+            paths = sorted(
+                p for pattern in ("**/*.md", "**/*.txt")
+                for p in glob.glob(str(path / pattern), recursive=True)
+            )
+            parts = [
+                f"=== {Path(p).relative_to(REPO_ROOT)} ===\n"
+                f"{Path(p).read_text(encoding='utf-8', errors='replace')}"
+                for p in paths
+            ]
+            return "\n\n".join(parts), len(paths)
         text = path.read_text(encoding="utf-8", errors="replace")
         return f"=== {path.relative_to(REPO_ROOT)} ===\n{text}", 1
 
