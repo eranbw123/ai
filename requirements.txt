@@ -1,0 +1,7 @@
+# Only third-party dependency in the repo (confirmed via import scan across
+# every .py file) -- everything else (cdp.py, common.py, council_bot.py's
+# Telegram/browser-backend code, the export scripts) is Python stdlib only.
+# Needed only for council_bot.py's "api" backend (COUNCIL_BACKEND=api); the
+# "browser" backend doesn't call this SDK at all, but it's still required at
+# import time since council_bot.py imports it unconditionally.
+anthropic>=0.120.2
