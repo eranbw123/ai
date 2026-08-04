@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -44,10 +45,26 @@ import cdp
 from claude_export_cdp import require_org_id
 from common import REPO_ROOT, load_env_local
 
+# When stdout/stderr are redirected to a file (e.g. `python council_bot.py >>
+# council_bot.log`), Windows makes Python fall back to the console's ANSI
+# codepage (e.g. cp1255) instead of UTF-8 for that stream. Telegram messages
+# are arbitrary Unicode (Hebrew questions, emoji, punctuation like U+2011),
+# and printing one with an unencodable character raises UnicodeEncodeError
+# and kills the whole process -- silently dropping whatever was in flight.
+# Force UTF-8 (with lossy fallback, never a crash) up front. Also force line
+# buffering: redirecting to a file switches Python to full buffering, so
+# without this, log lines for an in-flight question sit unflushed in memory
+# -- invisible to `tail -f`/log-watching -- until the buffer happens to fill
+# or the process exits.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+
 MODEL = "claude-opus-5"
 MAX_TOKENS = 24000
 POLL_TIMEOUT = 30  # seconds, Telegram long-poll
 TELEGRAM_MESSAGE_LIMIT = 4000  # Telegram's hard cap is 4096
+HEARTBEAT_INTERVAL = 30  # seconds between "still working" pings while a question runs
 
 # claude.ai's internal model slug for the browser backend (distinct from the
 # public API model IDs above) -- per cyber-wojtek/Claude-API's constants.py.
@@ -167,6 +184,31 @@ def tg_send_message(token, chat_id, text):
     for start in range(0, len(text), TELEGRAM_MESSAGE_LIMIT):
         chunk = text[start:start + TELEGRAM_MESSAGE_LIMIT]
         tg_call(token, "sendMessage", {"chat_id": chat_id, "text": chunk})
+
+
+def run_with_heartbeat(fn, token, chat_id, interval=HEARTBEAT_INTERVAL):
+    """Call fn() (expected to block for a while) and, in parallel, send a
+    "still working" ping to Telegram every `interval` seconds until fn()
+    returns or raises. Returns fn()'s result; propagates its exception
+    unchanged. A failed heartbeat send is logged but never aborts fn()."""
+    stop = threading.Event()
+    start = time.monotonic()
+
+    def heartbeat_loop():
+        while not stop.wait(interval):
+            elapsed = int(time.monotonic() - start)
+            try:
+                tg_send_message(token, chat_id, f"Still working on it... ({elapsed}s elapsed)")
+            except Exception as e:  # noqa: BLE001 -- heartbeat is best-effort
+                print(f"Heartbeat send failed: {e}", file=sys.stderr)
+
+    thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    thread.start()
+    try:
+        return fn()
+    finally:
+        stop.set()
+        thread.join(timeout=interval)
 
 
 def extract_final_call(text):
@@ -438,7 +480,9 @@ def main():
             try:
                 context_text, n_files = load_context()
                 print(f"Context: {n_files} exported conversation(s)")
-                answer = ask(question, context_text)
+                answer = run_with_heartbeat(
+                    lambda: ask(question, context_text), token, chat_id
+                )
             except Exception as e:  # noqa: BLE001
                 print(f"Council failed: {e}", file=sys.stderr)
                 tg_send_message(token, chat_id, f"Council failed: {e}")

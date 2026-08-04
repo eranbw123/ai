@@ -9,6 +9,8 @@ evaluated in a browser here) against synthetic data.
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -23,6 +25,7 @@ from council_bot import (  # noqa: E402
     js_send_completion,
     js_upload_context_file,
     load_context,
+    run_with_heartbeat,
     tg_send_message,
 )
 
@@ -118,6 +121,53 @@ class TestTgSendMessage(unittest.TestCase):
         mock_call.assert_called_once_with(
             "fake-token", "sendMessage", {"chat_id": 123, "text": "short reply"}
         )
+
+
+class TestRunWithHeartbeat(unittest.TestCase):
+    def test_pings_telegram_while_fn_is_still_running(self):
+        first_ping = threading.Event()
+        calls = []
+
+        def fake_tg_send_message(token, chat_id, text):
+            calls.append((token, chat_id, text))
+            first_ping.set()
+
+        def slow_fn():
+            self.assertTrue(first_ping.wait(timeout=2), "heartbeat never fired")
+            return "the answer"
+
+        with patch("council_bot.tg_send_message", side_effect=fake_tg_send_message):
+            result = run_with_heartbeat(slow_fn, "tok", 123, interval=0.01)
+
+        self.assertEqual(result, "the answer")
+        self.assertGreaterEqual(len(calls), 1)
+        token, chat_id, text = calls[0]
+        self.assertEqual((token, chat_id), ("tok", 123))
+        self.assertIn("Still working on it", text)
+
+    def test_no_ping_and_no_hang_when_fn_finishes_before_first_interval(self):
+        with patch("council_bot.tg_send_message") as mock_send:
+            start = time.monotonic()
+            result = run_with_heartbeat(lambda: "fast result", "tok", 123, interval=10)
+            elapsed = time.monotonic() - start
+
+        self.assertEqual(result, "fast result")
+        mock_send.assert_not_called()
+        self.assertLess(elapsed, 2)  # must not block for the full interval
+
+    def test_propagates_exception_and_stops_heartbeat_thread(self):
+        with patch("council_bot.tg_send_message") as mock_send:
+            before = threading.active_count()
+            with self.assertRaisesRegex(ValueError, "boom"):
+                run_with_heartbeat(_raise_boom, "tok", 123, interval=10)
+            after = threading.active_count()
+
+        mock_send.assert_not_called()
+        self.assertEqual(before, after)  # heartbeat thread cleaned up, not leaked
+
+
+def _raise_boom():
+    raise ValueError("boom")
 
 
 class TestJsPayloadBuilders(unittest.TestCase):
