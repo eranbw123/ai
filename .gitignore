@@ -2,5 +2,13 @@
 exports**/
 __pycache__/
 .venv/
+conversations.db
+conversations.db-shm
+conversations.db-wal
+conversations.db.bak-*
+conversations.db.import-lock
+.viewer_auth
+server.log
 poll_state.json
 poll_conversations.log
+poll_conversations.err.log
