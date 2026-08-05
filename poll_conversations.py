@@ -117,31 +117,43 @@ def compute_after(conn, source, state, now, *, overlap, bootstrap_days):
 MAX_TITLES_IN_NOTIFICATION = 10  # ntfy messages have no hard limit, but keep pings skimmable
 
 
-def notify_new(source, stats):
-    """Silent (low-priority, no alert sound) ntfy.sh ping whenever a cycle actually
-    added something new -- same topic/plumbing as export_to_sqlite.py's own
-    progress notifications, and same "low = silent" convention council_bot.py
-    uses for its own routine pings. Never called for a source that only saw
-    unchanged/updated rows -- just genuinely new conversations. Lists each new
-    conversation's title (run_claude()/run_chatgpt() collect these in
-    stats["inserted_titles"]) so the ping is actually useful at a glance
-    rather than just a bare count."""
-    inserted = stats.get("inserted", 0)
-    if inserted <= 0:
+def _notify_titles(source, verb, count, titles, *, tags):
+    """One silent (low-priority, no alert sound) ntfy.sh ping listing up to
+    MAX_TITLES_IN_NOTIFICATION conversation titles -- shared by the "new" and
+    "updated" cases below, which differ only in verb/tag/which stats field."""
+    if count <= 0:
         return
-    titles = stats.get("inserted_titles", [])
     shown = titles[:MAX_TITLES_IN_NOTIFICATION]
     lines = "\n".join(f"- {t}" for t in shown)
     if len(titles) > len(shown):
         lines += f"\n- (+{len(titles) - len(shown)} more)"
-    message = f"{inserted} new {source} conversation{'s' if inserted != 1 else ''}:\n{lines}" if lines \
-        else f"{inserted} new {source} conversation{'s' if inserted != 1 else ''} added to conversations.db"
-    ets.ntfy_notify(
-        f"New {source} conversation{'s' if inserted != 1 else ''}",
-        message,
-        priority="low",
-        tags="speech_balloon",
-    )
+    plural = "s" if count != 1 else ""
+    message = f"{count} {verb} {source} conversation{plural}:\n{lines}" if lines \
+        else f"{count} {verb} {source} conversation{plural} in conversations.db"
+    ets.ntfy_notify(f"{count} {verb} {source} conversation{plural}", message, priority="low", tags=tags)
+
+
+def notify_new(source, stats):
+    """Silent pings whenever a cycle actually changed something -- same
+    topic/plumbing as export_to_sqlite.py's own progress notifications, and
+    same "low = silent" convention council_bot.py uses for its own routine
+    pings. Two independent pings, since they mean different things:
+      - "new": a conversation that didn't exist in the db before
+        (stats["inserted"]/["inserted_titles"]).
+      - "updated": an existing conversation whose content_hash changed --
+        i.e. it got a new message since the last poll (stats["updated"]/
+        ["updated_titles"]). Only fires for a *real* content change:
+        compute_content_hash() in export_to_sqlite.py already ignores
+        non-semantic reordering (e.g. ChatGPT's safe_urls field, which
+        shuffles on every fetch) that used to make this fire on essentially
+        every touched conversation regardless of whether anything was
+        actually said -- verified live before that fix existed.
+    Either, both, or neither may fire in a given call depending on what
+    that cycle's stats actually contain."""
+    _notify_titles(source, "new", stats.get("inserted", 0), stats.get("inserted_titles", []),
+                   tags="speech_balloon")
+    _notify_titles(source, "updated", stats.get("updated", 0), stats.get("updated_titles", []),
+                   tags="pencil2")
 
 
 def poll_once(conn, state, *, port, overlap, bootstrap_days):

@@ -3,6 +3,7 @@
 credentials -- run_claude()/run_chatgpt() are exercised against a fake CDP
 connection and a throwaway in-memory db).
 """
+import json
 import sys
 import sqlite3
 import types
@@ -127,6 +128,7 @@ class TestUpdatedAtFiltering(unittest.TestCase):
 
         self.assertEqual(stats["updated"] + stats["inserted"], 1, "conversation was wrongly filtered out")
         self.assertEqual(stats["updated"], 1)  # already existed -> updated, not inserted
+        self.assertEqual(stats["updated_titles"], ["Old title"])
 
     def test_claude_resyncs_old_conversation_that_was_recently_updated(self):
         conv_id = "6a700000-0000-4000-8000-000000000011"
@@ -148,6 +150,103 @@ class TestUpdatedAtFiltering(unittest.TestCase):
 
         self.assertEqual(stats["updated"] + stats["inserted"], 1, "conversation was wrongly filtered out")
         self.assertEqual(stats["updated"], 1)
+        self.assertEqual(stats["updated_titles"], ["Old title"])
+
+
+class TestContentHashStability(unittest.TestCase):
+    """Regression coverage for a real bug caught live: ChatGPT returns some
+    bookkeeping list fields (e.g. safe_urls) in a different element order on
+    every single fetch, even when nothing about the conversation actually
+    changed -- which made content_hash (and therefore the "updated" outcome)
+    flap on essentially every poll cycle. compute_content_hash() must ignore
+    that kind of reordering while still catching real content changes."""
+
+    def test_reordered_scalar_list_hashes_the_same(self):
+        a = {"id": "c1", "safe_urls": ["https://a.com", "https://b.com", "https://c.com"]}
+        b = {"id": "c1", "safe_urls": ["https://c.com", "https://a.com", "https://b.com"]}
+        self.assertEqual(ets.compute_content_hash(a), ets.compute_content_hash(b))
+
+    def test_reordered_message_list_still_changes_the_hash(self):
+        # Lists of dicts (actual message content) must NOT be reordered for
+        # hashing purposes -- their order is semantically meaningful.
+        a = {"chat_messages": [{"uuid": "1", "text": "first"}, {"uuid": "2", "text": "second"}]}
+        b = {"chat_messages": [{"uuid": "2", "text": "second"}, {"uuid": "1", "text": "first"}]}
+        self.assertNotEqual(ets.compute_content_hash(a), ets.compute_content_hash(b))
+
+    def test_a_real_added_message_still_changes_the_hash(self):
+        a = {"id": "c1", "safe_urls": ["https://a.com"], "chat_messages": [{"uuid": "1", "text": "hi"}]}
+        b = {"id": "c1", "safe_urls": ["https://a.com"],
+             "chat_messages": [{"uuid": "1", "text": "hi"}, {"uuid": "2", "text": "new reply"}]}
+        self.assertNotEqual(ets.compute_content_hash(a), ets.compute_content_hash(b))
+
+    def test_dict_key_order_does_not_affect_the_hash(self):
+        a = {"id": "c1", "title": "t"}
+        b = {"title": "t", "id": "c1"}
+        self.assertEqual(ets.compute_content_hash(a), ets.compute_content_hash(b))
+
+    def test_upsert_reports_unchanged_for_reordered_only_content(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.executescript(ets.SCHEMA)
+        first = {"id": "c1", "safe_urls": ["https://a.com", "https://b.com"]}
+        second = {"id": "c1", "safe_urls": ["https://b.com", "https://a.com"]}  # reordered, not changed
+
+        outcome1, _ = ets.upsert(conn, source="chatgpt", conversation_id="c1", title="t", model=None,
+                                  created_at="2026-01-01T00:00:00+00:00", updated_at="2026-01-01T00:00:00+00:00",
+                                  raw_obj=first)
+        outcome2, _ = ets.upsert(conn, source="chatgpt", conversation_id="c1", title="t", model=None,
+                                  created_at="2026-01-01T00:00:00+00:00", updated_at="2026-08-05T00:00:00+00:00",
+                                  raw_obj=second)
+        self.assertEqual(outcome1, "inserted")
+        self.assertEqual(outcome2, "unchanged", "reordering-only content must not look like a real update")
+
+
+class TestRehashMigration(unittest.TestCase):
+    """rehash_all_content_hashes() -- the one-time migration that has to run
+    once after the hashing-scheme change, so old rows' stored content_hash
+    (computed with the pre-fix, order-sensitive scheme) doesn't look
+    "changed" the next time the poller merely re-checks them."""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript(ets.SCHEMA)
+        self.addCleanup(self.conn.close)
+
+    def insert_row(self, conv_id, raw_obj, stored_hash):
+        self.conn.execute(
+            """INSERT INTO raw_conversations
+               (source, conversation_id, title, raw_json, raw_source, content_hash)
+               VALUES ('chatgpt', ?, 't', ?, 'api_json', ?)""",
+            (conv_id, json.dumps(raw_obj), stored_hash),
+        )
+        self.conn.commit()
+
+    def test_recomputes_stale_hashes_and_reports_the_count(self):
+        # Simulates a row whose stored hash was computed with the old,
+        # order-sensitive scheme (a bogus placeholder here) -- must be
+        # brought up to date to the new canonical value.
+        self.insert_row("c1", {"id": "c1", "safe_urls": ["a", "b"]}, "stale-placeholder-hash")
+        changed, total = ets.rehash_all_content_hashes(self.conn)
+        self.assertEqual((changed, total), (1, 1))
+        row = self.conn.execute("SELECT content_hash FROM raw_conversations WHERE conversation_id='c1'").fetchone()
+        self.assertEqual(row[0], ets.compute_content_hash({"id": "c1", "safe_urls": ["a", "b"]}))
+
+    def test_leaves_already_correct_hashes_untouched(self):
+        raw_obj = {"id": "c1", "safe_urls": ["a", "b"]}
+        self.insert_row("c1", raw_obj, ets.compute_content_hash(raw_obj))
+        changed, total = ets.rehash_all_content_hashes(self.conn)
+        self.assertEqual((changed, total), (0, 1))
+
+    def test_does_not_touch_raw_json_or_other_columns(self):
+        raw_obj = {"id": "c1", "safe_urls": ["a", "b"]}
+        self.insert_row("c1", raw_obj, "stale")
+        ets.rehash_all_content_hashes(self.conn)
+        row = self.conn.execute(
+            "SELECT raw_json, title, raw_source FROM raw_conversations WHERE conversation_id='c1'"
+        ).fetchone()
+        self.assertEqual(json.loads(row[0]), raw_obj)
+        self.assertEqual(row[1], "t")
+        self.assertEqual(row[2], "api_json")
 
 
 if __name__ == "__main__":

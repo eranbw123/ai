@@ -106,9 +106,44 @@ def find_chatgpt_model(data):
     return None
 
 
+_HASH_SCALAR_TYPES = (str, int, float, bool, type(None))
+
+
+def _canonicalize_for_hash(value):
+    """Recursively normalize a JSON-able structure before hashing: sorts any
+    list whose elements are all plain scalars (str/int/float/bool/None).
+
+    ChatGPT (and possibly Claude) return some "bookkeeping" lists -- e.g.
+    safe_urls -- in a different element order on every single fetch, even
+    when nothing about the conversation actually changed. Verified live: two
+    back-to-back fetches of the same, untouched conversation differed only
+    in safe_urls' order, which made content_hash flap on every poll cycle
+    regardless of whether a real edit happened.
+
+    Lists containing dicts or nested lists (chat_messages, mapping nodes,
+    message content parts) are left exactly as returned -- their order can
+    carry real meaning (message sequence) and isn't safe to reorder
+    generically. Dict key order doesn't need handling here since
+    json.dumps(..., sort_keys=True) at the call site already normalizes it.
+    """
+    if isinstance(value, dict):
+        return {k: _canonicalize_for_hash(v) for k, v in value.items()}
+    if isinstance(value, list):
+        normalized = [_canonicalize_for_hash(v) for v in value]
+        if all(isinstance(v, _HASH_SCALAR_TYPES) for v in normalized):
+            return sorted(normalized, key=lambda v: (str(type(v)), str(v)))
+        return normalized
+    return value
+
+
+def compute_content_hash(raw_obj):
+    canonical = json.dumps(_canonicalize_for_hash(raw_obj), ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def upsert(conn, *, source, conversation_id, title, model, created_at, updated_at, raw_obj):
-    raw_json = json.dumps(raw_obj, ensure_ascii=False, indent=2)
-    content_hash = hashlib.sha256(raw_json.encode("utf-8")).hexdigest()
+    raw_json = json.dumps(raw_obj, ensure_ascii=False, indent=2)  # stored verbatim -- full raw API fidelity
+    content_hash = compute_content_hash(raw_obj)  # hashed from a canonicalized copy -- see above
 
     superseded = conn.execute(
         """DELETE FROM raw_conversations
@@ -162,7 +197,8 @@ def run_claude(conn, args):
             filtered = filtered[: args.limit]
         print(f"claude: {len(filtered)} of {len(conversations)} conversations to import")
 
-        stats = {"inserted": 0, "updated": 0, "unchanged": 0, "superseded": 0, "failed": 0, "inserted_titles": []}
+        stats = {"inserted": 0, "updated": 0, "unchanged": 0, "superseded": 0, "failed": 0,
+                  "inserted_titles": [], "updated_titles": []}
         for i, conv in enumerate(filtered, 1):
             if not cc.UUID_RE.match(conv["uuid"]):
                 continue
@@ -182,6 +218,8 @@ def run_claude(conn, args):
                 stats["superseded"] += superseded
                 if outcome == "inserted":
                     stats["inserted_titles"].append(data.get("name") or "(untitled)")
+                elif outcome == "updated":
+                    stats["updated_titles"].append(data.get("name") or "(untitled)")
                 print(f"[{i}/{len(filtered)}] {outcome} ({'superseded old row, ' if superseded else ''}{data.get('name')!r})")
                 if i % args.batch_size == 0:
                     conn.commit()
@@ -207,7 +245,8 @@ def run_chatgpt(conn, args):
             filtered = filtered[: args.limit]
         print(f"chatgpt: {len(filtered)} of {len(conversations)} conversations to import (limit={args.limit})")
 
-        stats = {"inserted": 0, "updated": 0, "unchanged": 0, "superseded": 0, "failed": 0, "inserted_titles": []}
+        stats = {"inserted": 0, "updated": 0, "unchanged": 0, "superseded": 0, "failed": 0,
+                  "inserted_titles": [], "updated_titles": []}
         for i, conv in enumerate(filtered, 1):
             if not gc.UUID_RE.match(conv["id"]):
                 continue
@@ -237,6 +276,8 @@ def run_chatgpt(conn, args):
                 stats["superseded"] += superseded
                 if outcome == "inserted":
                     stats["inserted_titles"].append(title or "(untitled)")
+                elif outcome == "updated":
+                    stats["updated_titles"].append(title or "(untitled)")
                 print(f"[{i}/{len(filtered)}] {outcome} ({'superseded old row, ' if superseded else ''}{title!r})")
                 if i % args.batch_size == 0:
                     conn.commit()
@@ -268,6 +309,33 @@ def run_chatgpt(conn, args):
         gconn.close()
 
 
+def rehash_all_content_hashes(conn):
+    """One-time, local-only migration: recompute content_hash for every row
+    using compute_content_hash()'s canonicalized scheme, from the raw_json
+    already stored -- no network calls, nothing else touched.
+
+    Needed once, right after the canonicalization fix ships: without this,
+    the next time a poll cycle (re-)touches an old row, it would look
+    "updated" purely because the hash *algorithm* changed, not because
+    anything about the conversation actually did -- and since updates now
+    trigger a silent ntfy ping too, that would mean a burst of false
+    "conversation updated" pings for every conversation the poller happens
+    to touch first, exactly the noise this fix exists to prevent. raw_json,
+    title, timestamps, and imported_at are all left exactly as they are.
+
+    Returns (changed, total).
+    """
+    rows = conn.execute("SELECT id, raw_json, content_hash FROM raw_conversations").fetchall()
+    changed = 0
+    for row_id, raw_json, old_hash in rows:
+        new_hash = compute_content_hash(json.loads(raw_json))
+        if new_hash != old_hash:
+            conn.execute("UPDATE raw_conversations SET content_hash = ? WHERE id = ?", (new_hash, row_id))
+            changed += 1
+    conn.commit()
+    return changed, len(rows)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=9222)
@@ -280,6 +348,8 @@ def main():
     sub = parser.add_subparsers(dest="source", required=True)
     sub.add_parser("claude")
     sub.add_parser("chatgpt")
+    sub.add_parser("rehash", help="One-time local migration: recompute content_hash for every "
+                                   "existing row after a hashing-scheme change. No network calls.")
     args = parser.parse_args()
 
     # Windows console defaults to a non-UTF-8 codepage; conversation titles
@@ -294,8 +364,11 @@ def main():
     try:
         if args.source == "claude":
             run_claude(conn, args)
-        else:
+        elif args.source == "chatgpt":
             run_chatgpt(conn, args)
+        else:
+            changed, total = rehash_all_content_hashes(conn)
+            print(f"rehash done: {changed}/{total} rows had their content_hash recomputed")
     finally:
         conn.close()
 
