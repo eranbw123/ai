@@ -10,12 +10,14 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from poll_conversations import (  # noqa: E402
     compute_after,
     db_max_created_at,
     load_state,
+    poll_once,
     save_state,
 )
 import export_to_sqlite as ets  # noqa: E402
@@ -29,6 +31,7 @@ class TestComputeAfter(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
         self.conn.executescript(ets.SCHEMA)
+        self.addCleanup(self.conn.close)
 
     def insert(self, source, conv_id, created_at):
         self.conn.execute(
@@ -72,6 +75,59 @@ class TestComputeAfter(unittest.TestCase):
     def test_db_max_created_at_ignores_other_source(self):
         self.insert("chatgpt", "g1", (NOW - timedelta(days=1)).isoformat())
         self.assertIsNone(db_max_created_at(self.conn, "claude"))
+
+
+class TestPollOnceRetryOnFailure(unittest.TestCase):
+    """A single failed item within an otherwise-successful cycle (e.g. a
+    transient 'database is locked' collision with a concurrent manual
+    import) must not advance that source's window -- otherwise the failed
+    conversation's created_at falls before the next cycle's --after and is
+    silently skipped forever. Regression coverage for exactly that bug,
+    caught live: a real conversation ('Test convo') hit this during
+    development and was dropped until this check was added."""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript(ets.SCHEMA)
+        self.addCleanup(self.conn.close)
+
+    def test_failed_item_does_not_advance_window(self):
+        state = {}
+        with patch("poll_conversations.ets.run_claude", return_value={"inserted": 0, "failed": 1}), \
+             patch("poll_conversations.ets.run_chatgpt", return_value={"inserted": 0, "failed": 0}), \
+             patch("poll_conversations.save_state"):
+            poll_once(self.conn, state, port=9222, overlap=OVERLAP, bootstrap_days=BOOTSTRAP_DAYS)
+        self.assertNotIn("last_success_at", state["claude"])
+        self.assertIn("last_success_at", state["chatgpt"])
+
+    def test_clean_cycle_advances_window(self):
+        state = {}
+        with patch("poll_conversations.ets.run_claude", return_value={"inserted": 2, "failed": 0}), \
+             patch("poll_conversations.ets.run_chatgpt", return_value={"inserted": 0, "failed": 0}), \
+             patch("poll_conversations.save_state"):
+            poll_once(self.conn, state, port=9222, overlap=OVERLAP, bootstrap_days=BOOTSTRAP_DAYS)
+        self.assertIn("last_success_at", state["claude"])
+
+    def test_notify_fires_only_when_something_was_inserted(self):
+        state = {}
+        with patch("poll_conversations.ets.run_claude", return_value={"inserted": 3, "failed": 0}), \
+             patch("poll_conversations.ets.run_chatgpt", return_value={"inserted": 0, "failed": 0}), \
+             patch("poll_conversations.save_state"), \
+             patch("poll_conversations.ets.ntfy_notify") as mock_notify:
+            poll_once(self.conn, state, port=9222, overlap=OVERLAP, bootstrap_days=BOOTSTRAP_DAYS)
+        self.assertEqual(mock_notify.call_count, 1)
+        args, kwargs = mock_notify.call_args
+        self.assertIn("claude", args[0])
+        self.assertEqual(kwargs.get("priority"), "low")
+
+    def test_system_exit_from_missing_tab_does_not_crash_the_cycle(self):
+        state = {}
+        with patch("poll_conversations.ets.run_claude", side_effect=SystemExit("no tab")), \
+             patch("poll_conversations.ets.run_chatgpt", return_value={"inserted": 0, "failed": 0}), \
+             patch("poll_conversations.save_state"):
+            poll_once(self.conn, state, port=9222, overlap=OVERLAP, bootstrap_days=BOOTSTRAP_DAYS)  # must not raise
+        self.assertNotIn("last_success_at", state["claude"])
+        self.assertIn("last_error", state["claude"])
 
 
 class TestStatePersistence(unittest.TestCase):

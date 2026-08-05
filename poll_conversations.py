@@ -25,11 +25,16 @@ Catch-up window ("--after"), per source, independently:
     loaded from poll_state.json on startup, so a gap of hours or days just
     means a wider --after on the first cycle back, not a blind spot.
 
-A source's timestamp only advances after a cycle that *succeeds* for that
-source. If the required Chrome tab isn't open (connect() raises SystemExit)
-or the fetch fails outright, that source's window is left exactly where it
-was and gets retried next cycle -- so a closed tab or a network blip only
-delays catch-up, it never skips conversations.
+A source's timestamp only advances after a cycle with zero failures for that
+source -- run_claude()/run_chatgpt() catch failures per-item internally and
+keep going, so a whole-cycle try/except isn't enough to notice one; we check
+the returned stats dict's "failed" count instead. If the required Chrome tab
+isn't open (connect() raises SystemExit), the fetch fails outright, or even
+a single item in an otherwise-fine cycle fails (e.g. "database is locked"
+colliding with a concurrent manual import), that source's window is left
+exactly where it was and gets retried next cycle -- so a closed tab, a
+network blip, or a transient per-item error only delays catch-up, it never
+silently skips a conversation.
 
 State (poll_state.json) and the log this writes to are both gitignored,
 same as conversations.db itself.
@@ -98,6 +103,23 @@ def compute_after(conn, source, state, now, *, overlap, bootstrap_days):
     return db_max if db_max is not None else (now - timedelta(days=bootstrap_days))
 
 
+def notify_new(source, stats):
+    """Silent (low-priority, no alert sound) ntfy.sh ping whenever a cycle actually
+    added something new -- same topic/plumbing as export_to_sqlite.py's own
+    progress notifications, and same "low = silent" convention council_bot.py
+    uses for its own routine pings. Never called for a source that only saw
+    unchanged/updated rows -- just genuinely new conversations."""
+    inserted = stats.get("inserted", 0)
+    if inserted <= 0:
+        return
+    ets.ntfy_notify(
+        f"New {source} conversation{'s' if inserted != 1 else ''}",
+        f"{inserted} new {source} conversation{'s' if inserted != 1 else ''} added to conversations.db",
+        priority="low",
+        tags="speech_balloon",
+    )
+
+
 def poll_once(conn, state, *, port, overlap, bootstrap_days):
     now = datetime.now(timezone.utc)
     for source in SOURCES:
@@ -110,11 +132,25 @@ def poll_once(conn, state, *, port, overlap, bootstrap_days):
         log(f"{source}: polling since {after.isoformat()}")
         try:
             if source == "claude":
-                ets.run_claude(conn, args)
+                stats = ets.run_claude(conn, args)
             else:
-                ets.run_chatgpt(conn, args)
-            state[source]["last_success_at"] = now.isoformat()
+                stats = ets.run_chatgpt(conn, args)
+            if stats.get("failed", 0) == 0:
+                # Only advance the window on a clean cycle. A per-item failure
+                # (e.g. "database is locked" colliding with a concurrent manual
+                # import) must NOT move --after forward -- otherwise that
+                # conversation's created_at falls before the next cycle's
+                # window and it's silently skipped forever. Leaving the
+                # timestamp put means the same (now wider) window gets
+                # retried next cycle until it succeeds. Verified live: this
+                # is exactly what happened to a real conversation before this
+                # check existed.
+                state[source]["last_success_at"] = now.isoformat()
+            else:
+                log(f"{source}: {stats['failed']} item(s) failed this cycle -- "
+                    f"window left at {after.isoformat()}, will retry next cycle")
             state[source]["last_error"] = None
+            notify_new(source, stats)
         except SystemExit as e:
             # connect() sys.exit()s when the required tab (claude.ai /
             # chatgpt.com) isn't open in the CDP-attached Chrome -- not
@@ -145,7 +181,30 @@ def main():
             stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
     overlap = timedelta(minutes=args.overlap_minutes)
-    conn = sqlite3.connect(args.db, timeout=30)  # timeout = retry window for "database is locked"
+    # timeout = retry window for "database is locked" (busy_timeout). 60s because this
+    # DB also gets written by manual `export_to_sqlite.py` full-import runs, which can
+    # hold a write transaction open for tens of seconds across many inserts between
+    # commits (--batch-size); WAL shortens that window further -- unlike the default
+    # rollback-journal mode, a WAL writer doesn't need to rewrite the whole journal per
+    # commit, and readers never block it either. Two concurrent *writers* still
+    # serialize (WAL doesn't remove that), but each one's lock is held for much less
+    # time, so 60s of retrying comfortably rides out a collision either way. Verified
+    # live: without this, a concurrent full backfill import caused a "database is
+    # locked" failure on a poll cycle within the first minute of running.
+    conn = sqlite3.connect(args.db, timeout=60)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as e:
+        # Switching journal modes needs exclusive access to the file, which
+        # doesn't go through the normal busy_timeout retry loop -- it just
+        # fails immediately if another process (e.g. a concurrent manual
+        # export_to_sqlite.py run) already has the db open. Non-fatal: stay
+        # on the default rollback-journal mode for this run; the 60s
+        # busy_timeout above still covers ordinary "database is locked"
+        # contention on reads/writes, just with a longer average wait than
+        # WAL would give. Verified live: this exact collision crashed the
+        # poller at startup before this fallback existed.
+        log(f"could not switch to WAL journal mode ({e}), continuing without it")
     conn.executescript(ets.SCHEMA)
     state = load_state()
 
