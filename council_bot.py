@@ -26,12 +26,19 @@ Setup:
        launch Chrome per claude_export_cdp.py's docstring.
     2. pip install anthropic
     3. python council_bot.py
+
+Also pushes ntfy.sh notifications (see ntfy_notify) alongside the Telegram
+traffic: low-priority/silent when a question is received and on each
+heartbeat, high-priority on failure, urgent (real banner) when the reply is
+sent -- defaults to the same topic Claude Code's own hooks use; override
+with NTFY_TOPIC/NTFY_BASE in .env.local, or set NTFY_TOPIC="" to disable.
 """
 import glob
 import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -44,10 +51,36 @@ import cdp
 from claude_export_cdp import require_org_id
 from common import REPO_ROOT, load_env_local
 
+# When stdout/stderr are redirected to a file (e.g. `python council_bot.py >>
+# council_bot.log`), Windows makes Python fall back to the console's ANSI
+# codepage (e.g. cp1255) instead of UTF-8 for that stream. Telegram messages
+# are arbitrary Unicode (Hebrew questions, emoji, punctuation like U+2011),
+# and printing one with an unencodable character raises UnicodeEncodeError
+# and kills the whole process -- silently dropping whatever was in flight.
+# Force UTF-8 (with lossy fallback, never a crash) up front. Also force line
+# buffering: redirecting to a file switches Python to full buffering, so
+# without this, log lines for an in-flight question sit unflushed in memory
+# -- invisible to `tail -f`/log-watching -- until the buffer happens to fill
+# or the process exits.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+
 MODEL = "claude-opus-5"
 MAX_TOKENS = 24000
 POLL_TIMEOUT = 30  # seconds, Telegram long-poll
 TELEGRAM_MESSAGE_LIMIT = 4000  # Telegram's hard cap is 4096
+HEARTBEAT_INTERVAL = 30  # seconds between "still working" pings while a question runs
+
+# Push notifications via ntfy.sh, mirroring the same topic Claude Code's own
+# Stop/Notification hooks use (see ~/.claude/settings.json) so everything
+# lands in the one ntfy app subscription. Override via NTFY_TOPIC/NTFY_BASE
+# in .env.local; set NTFY_TOPIC="" to disable entirely (e2e_verify_bot.py's
+# mock mode does this so automated test runs don't page the phone). Read at
+# call time (not a module-level constant) so both .env.local and per-process
+# env overrides -- neither loaded/set until after this module first imports
+# -- actually take effect, same reasoning as tg_call's TELEGRAM_API_BASE.
+DEFAULT_NTFY_TOPIC = "claude-code-4a93bd81fbc78f6974701714"
 
 # claude.ai's internal model slug for the browser backend (distinct from the
 # public API model IDs above) -- per cyber-wojtek/Claude-API's constants.py.
@@ -118,13 +151,26 @@ list — sized to fit a phone screen>\
 
 
 def load_context():
-    # POC scoping: point at a single export file instead of globbing all of
-    # them (useful while testing generation time against a small context).
-    single_file = os.environ.get("COUNCIL_CONTEXT_FILE")
-    if single_file:
-        path = Path(single_file)
+    # POC scoping: point at a single export file or a single exports*/
+    # subdirectory instead of globbing all of them (useful to scope context
+    # down -- e.g. to just the last couple of days -- without touching the
+    # full export history under exports*/).
+    scoped = os.environ.get("COUNCIL_CONTEXT_FILE")
+    if scoped:
+        path = Path(scoped)
         if not path.is_absolute():
             path = REPO_ROOT / path
+        if path.is_dir():
+            paths = sorted(
+                p for pattern in ("**/*.md", "**/*.txt")
+                for p in glob.glob(str(path / pattern), recursive=True)
+            )
+            parts = [
+                f"=== {Path(p).relative_to(REPO_ROOT)} ===\n"
+                f"{Path(p).read_text(encoding='utf-8', errors='replace')}"
+                for p in paths
+            ]
+            return "\n\n".join(parts), len(paths)
         text = path.read_text(encoding="utf-8", errors="replace")
         return f"=== {path.relative_to(REPO_ROOT)} ===\n{text}", 1
 
@@ -140,7 +186,11 @@ def load_context():
 
 
 def tg_call(token, method, params=None, timeout=POLL_TIMEOUT + 10):
-    url = f"https://api.telegram.org/bot{token}/{method}"
+    # Overridable so an automated test harness can point this at a local
+    # fake Telegram server instead of the real api.telegram.org -- see
+    # e2e_verify_bot.py. Never needed for normal use.
+    api_base = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org")
+    url = f"{api_base}/bot{token}/{method}"
     data = json.dumps(params or {}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -154,6 +204,55 @@ def tg_send_message(token, chat_id, text):
     for start in range(0, len(text), TELEGRAM_MESSAGE_LIMIT):
         chunk = text[start:start + TELEGRAM_MESSAGE_LIMIT]
         tg_call(token, "sendMessage", {"chat_id": chat_id, "text": chunk})
+
+
+def ntfy_notify(title, message, priority="default", tags=None):
+    """Best-effort push notification via ntfy.sh. Never raises -- a failed
+    push must not take down the poll loop or a council run. No-ops if
+    NTFY_TOPIC is set to empty (explicitly disabled)."""
+    topic = os.environ.get("NTFY_TOPIC", DEFAULT_NTFY_TOPIC)
+    if not topic:
+        return
+    base = os.environ.get("NTFY_BASE", "https://ntfy.sh")
+    url = f"{base}/{topic}"
+    headers = {"Title": title, "Priority": priority}
+    if tags:
+        headers["Tags"] = tags
+    req = urllib.request.Request(url, data=message.encode("utf-8"), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as e:  # noqa: BLE001 -- push notifications are best-effort
+        print(f"ntfy notify failed: {e}", file=sys.stderr)
+
+
+def run_with_heartbeat(fn, interval=HEARTBEAT_INTERVAL):
+    """Call fn() (expected to block for a while) and, in parallel, push a
+    low-priority "still working" ntfy notification every `interval` seconds
+    until fn() returns or raises -- silent by design (see ntfy_notify), so
+    this no longer spams the Telegram chat itself. Returns fn()'s result;
+    propagates its exception unchanged."""
+    stop = threading.Event()
+    start = time.monotonic()
+
+    def heartbeat_loop():
+        while not stop.wait(interval):
+            elapsed = int(time.monotonic() - start)
+            ntfy_notify(
+                "Council still working",
+                f"Still working on it... ({elapsed}s elapsed)",
+                priority="low",
+                tags="hourglass_flowing_sand",
+            )
+            print(f"[heartbeat] ping sent ({elapsed}s elapsed)")
+
+    thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    thread.start()
+    try:
+        return fn()
+    finally:
+        stop.set()
+        thread.join(timeout=interval)
 
 
 def extract_final_call(text):
@@ -320,6 +419,21 @@ def default_log(message, err=False):
     print(message, file=sys.stderr if err else sys.stdout)
 
 
+def parse_completion_result(raw):
+    """Parse whatever conn.evaluate() handed back for js_send_completion.
+
+    js_send_completion's JS always returns `JSON.stringify({text,
+    messageLimit})` -- a string -- so this is normally just json.loads(raw).
+    But at least one Chrome/CDP combination has been observed handing the
+    value back already deserialized into a dict instead of the JSON string
+    (json.loads(a_dict) then blows up with a confusing TypeError). Accept
+    both shapes rather than crashing the whole question on it.
+    """
+    if isinstance(raw, dict):
+        return raw
+    return json.loads(raw)
+
+
 def ask_council_browser(question, context_text, port=9222, log=default_log):
     org_id = require_org_id()
     tab = cdp.find_claude_tab(port)
@@ -360,7 +474,7 @@ def ask_council_browser(question, context_text, port=9222, log=default_log):
                 f"{t3 - t2:.1f}s -- the Chrome tab was likely navigated/reloaded "
                 "mid-request. Leave the claude.ai tab alone while the bot is answering."
             )
-        result = json.loads(raw)
+        result = parse_completion_result(raw)
         text = result["text"]
         if result.get("messageLimit"):
             # Usage-window metadata, logged for visibility only -- never sent
@@ -375,6 +489,48 @@ def ask_council_browser(question, context_text, port=9222, log=default_log):
         return extract_final_call(text)
     finally:
         conn.close()
+
+
+def _truncate_for_push(text, limit=300):
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def handle_message(
+    question, ask, token, chat_id, load_context=load_context, heartbeat_interval=HEARTBEAT_INTERVAL
+):
+    """Handle one incoming question end to end: load context, run the
+    council (with heartbeat pings) and send the reply -- or, on failure,
+    send "Council failed: ..." instead. Never raises; this is the per-
+    message unit main()'s loop calls, and one bad question must not take
+    down the poll loop. Split out of main() so this wiring -- the exact
+    thing a heartbeat-shaped bug lives in -- is unit-testable without a
+    live Telegram/Chrome connection. load_context/heartbeat_interval are
+    swappable purely so tests can fake/speed them up.
+
+    Also fires ntfy.sh push notifications alongside the Telegram traffic:
+    low-priority (silent) on receipt and on each heartbeat, high-priority
+    on failure, urgent-priority (real banner) when the reply is ready --
+    the "is it done yet" moment is the one that should actually interrupt
+    you.
+    """
+    print(f"Question: {question}")
+    ntfy_notify(
+        "Council question received", _truncate_for_push(question), priority="low", tags="envelope",
+    )
+    try:
+        context_text, n_files = load_context()
+        print(f"Context: {n_files} exported conversation(s)")
+        answer = run_with_heartbeat(lambda: ask(question, context_text), interval=heartbeat_interval)
+    except Exception as e:  # noqa: BLE001
+        print(f"Council failed: {e}", file=sys.stderr)
+        tg_send_message(token, chat_id, f"Council failed: {e}")
+        ntfy_notify("Council failed", str(e), priority="high", tags="x")
+        return
+    tg_send_message(token, chat_id, answer)
+    ntfy_notify(
+        "Council reply sent", _truncate_for_push(answer), priority="urgent", tags="white_check_mark",
+    )
+    print("Sent reply to Telegram.")
 
 
 def main():
@@ -420,18 +576,7 @@ def main():
             if message["chat"]["id"] != chat_id:
                 continue  # ignore anyone but the configured chat
 
-            question = message["text"]
-            print(f"Question: {question}")
-            try:
-                context_text, n_files = load_context()
-                print(f"Context: {n_files} exported conversation(s)")
-                answer = ask(question, context_text)
-            except Exception as e:  # noqa: BLE001
-                print(f"Council failed: {e}", file=sys.stderr)
-                tg_send_message(token, chat_id, f"Council failed: {e}")
-                continue
-            tg_send_message(token, chat_id, answer)
-            print("Sent reply to Telegram.")
+            handle_message(message["text"], ask, token, chat_id)
 
 
 if __name__ == "__main__":
