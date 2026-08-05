@@ -200,11 +200,19 @@ def run_chatgpt(conn, args):
                 data = gconn.evaluate(gc.js_fetch_conversation(token, conv["id"]))
                 created_at = norm_ts(gc.parse_api_timestamp(data.get("create_time")))
                 updated_at = norm_ts(gc.parse_api_timestamp(data.get("update_time")))
+                # The per-conversation detail fetch (data) returns title=null for
+                # conversations too fresh for ChatGPT to have finished generating a
+                # title server-side yet, even though the list page (conv) already has
+                # it -- verified live (two real freshly-created test conversations
+                # both hit this). Prefer the detail title when present (kept in sync
+                # going forward), fall back to the list summary's rather than
+                # storing/reporting a needlessly wrong "(untitled)".
+                title = data.get("title") or conv.get("title")
                 outcome, superseded = upsert(
                     conn,
                     source="chatgpt",
                     conversation_id=conv["id"],
-                    title=data.get("title"),
+                    title=title,
                     model=find_chatgpt_model(data),
                     created_at=created_at,
                     updated_at=updated_at,
@@ -213,8 +221,8 @@ def run_chatgpt(conn, args):
                 stats[outcome] += 1
                 stats["superseded"] += superseded
                 if outcome == "inserted":
-                    stats["inserted_titles"].append(data.get("title") or "(untitled)")
-                print(f"[{i}/{len(filtered)}] {outcome} ({'superseded old row, ' if superseded else ''}{data.get('title')!r})")
+                    stats["inserted_titles"].append(title or "(untitled)")
+                print(f"[{i}/{len(filtered)}] {outcome} ({'superseded old row, ' if superseded else ''}{title!r})")
                 if i % args.batch_size == 0:
                     conn.commit()
                     print(f"  -- committed batch through {i} --")
