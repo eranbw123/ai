@@ -170,7 +170,11 @@ def load_context():
 
 
 def tg_call(token, method, params=None, timeout=POLL_TIMEOUT + 10):
-    url = f"https://api.telegram.org/bot{token}/{method}"
+    # Overridable so an automated test harness can point this at a local
+    # fake Telegram server instead of the real api.telegram.org -- see
+    # e2e_verify_bot.py. Never needed for normal use.
+    api_base = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org")
+    url = f"{api_base}/bot{token}/{method}"
     data = json.dumps(params or {}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:

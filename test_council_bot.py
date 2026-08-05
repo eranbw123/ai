@@ -101,6 +101,60 @@ class TestLoadContext(unittest.TestCase):
             self.assertNotIn("{}", text)
 
 
+class TestTgCall(unittest.TestCase):
+    def test_defaults_to_real_telegram_api(self):
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"ok": True, "result": "fine"}).encode("utf-8")
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            return FakeResponse()
+
+        with patch.dict("os.environ", {}, clear=False):
+            import os as _os
+            _os.environ.pop("TELEGRAM_API_BASE", None)
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                from council_bot import tg_call
+                tg_call("tok", "sendMessage", {"chat_id": 1, "text": "hi"})
+
+        self.assertEqual(captured["url"], "https://api.telegram.org/bottok/sendMessage")
+
+    def test_honors_telegram_api_base_override(self):
+        # e2e_verify_bot.py relies on this to point council_bot at a local
+        # fake Telegram server instead of the real API.
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"ok": True, "result": "fine"}).encode("utf-8")
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            return FakeResponse()
+
+        with patch.dict("os.environ", {"TELEGRAM_API_BASE": "http://127.0.0.1:9"}):
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                from council_bot import tg_call
+                tg_call("tok", "sendMessage", {"chat_id": 1, "text": "hi"})
+
+        self.assertEqual(captured["url"], "http://127.0.0.1:9/bottok/sendMessage")
+
+
 class TestTgSendMessage(unittest.TestCase):
     def test_splits_long_text_into_chunks_under_limit(self):
         long_text = "x" * (TELEGRAM_MESSAGE_LIMIT * 2 + 500)
