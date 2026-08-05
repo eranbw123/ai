@@ -245,9 +245,9 @@ def is_valid_conversation_payload(source, data):
     return bool(data.get(key)) if key else True
 
 
-def fetch_conversation_with_retry(fetch_fn, *, source, label, max_attempts=4, backoff_base=3):
+def fetch_conversation_with_retry(fetch_fn, *, source, label, max_attempts=4, backoff_base=10):
     """Call fetch_fn() (a zero-arg callable doing the actual per-conversation
-    CDP fetch) and retry with linear backoff (3s, 6s, 9s, ...) whenever the
+    CDP fetch) and retry with linear backoff (10s, 20s, 30s, ...) whenever the
     response doesn't look like a real conversation (see
     is_valid_conversation_payload) -- an empty/malformed response under load is
     a real, observed failure mode (see that function's docstring), not a
@@ -257,11 +257,15 @@ def fetch_conversation_with_retry(fetch_fn, *, source, label, max_attempts=4, ba
     propagates immediately without retrying here -- that already means
     something more specific went wrong and the caller's own except handles it.
 
-    backoff_base was originally 10 (10s/20s/30s); dropped to 3 after a live
-    full-history recovery run showed retries succeeding reliably well within
-    that window -- the point of the wait is to ride out a transient
-    rate-limit/glitch, not to punish it, and 10s/20s/30s across ~1 in 5 of
-    1600+ conversations made a full re-import take hours for no added safety.
+    backoff_base was briefly dropped to 3 (3s/6s/9s) after one recovery run
+    showed retries succeeding reliably within that window -- but a later run,
+    stacked on top of several other full-history passes against chatgpt.com
+    the same day, saw a much higher rate-limit rate: 13/24 items exhausted
+    all 4 attempts and permanently failed with the short backoff, vs. ~19%
+    needing any retry at all under the original 10s/20s/30s. The wait exists
+    to ride out real rate-limiting, not just a glitch, and a too-short window
+    trades "fast per item" for "recovers less data per pass" under load --
+    reverted back to 10 for that reason.
     """
     for attempt in range(1, max_attempts + 1):
         data = fetch_fn()
