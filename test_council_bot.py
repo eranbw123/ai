@@ -7,6 +7,7 @@ the claude.ai JS payload builders (pure string construction -- never actually
 evaluated in a browser here) against synthetic data.
 """
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -28,9 +29,45 @@ from council_bot import (  # noqa: E402
     load_context,
     ntfy_notify,
     parse_completion_result,
+    pick_random_conversation,
+    render_conversation,
     run_with_heartbeat,
     tg_send_message,
 )
+from export_to_sqlite import SCHEMA as RAW_CONVERSATIONS_SCHEMA  # noqa: E402
+
+SAMPLE_CLAUDE_RAW = {
+    "uuid": "conv-1",
+    "name": "Test Conversation",
+    "created_at": "2025-06-01T10:00:00.000000Z",
+    "updated_at": "2025-06-02T11:00:00.000000Z",
+    "model": "claude-sonnet-4-5-20250929",
+    "current_leaf_message_uuid": "b1",
+    "chat_messages": [
+        {"uuid": "a1", "sender": "human", "parent_message_uuid": None, "text": "Hello"},
+        {"uuid": "b1", "sender": "assistant", "parent_message_uuid": "a1", "text": "Hi there, distinctive marker XYZ"},
+    ],
+}
+
+
+def make_raw_conversations_db(rows):
+    """rows: list of (source, conversation_id, title, raw_source, raw_obj) tuples.
+    Returns the path to a throwaway sqlite file shaped like conversations.db."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    conn = sqlite3.connect(tmp.name)
+    conn.executescript(RAW_CONVERSATIONS_SCHEMA)
+    for source, conv_id, title, raw_source, raw_obj in rows:
+        raw_json = json.dumps(raw_obj)
+        conn.execute(
+            """INSERT INTO raw_conversations
+               (source, conversation_id, title, raw_json, raw_source, content_hash)
+               VALUES (?, ?, ?, ?, ?, 'h')""",
+            (source, conv_id, title, raw_json, raw_source),
+        )
+    conn.commit()
+    conn.close()
+    return tmp.name
 
 
 class TestExtractFinalCall(unittest.TestCase):
@@ -79,27 +116,61 @@ class TestLoadContext(unittest.TestCase):
             self.assertIn("scoped txt content", text)
             self.assertNotIn("{}", text)
 
-    def test_globs_exports_dirs_relative_to_repo_root(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            exports_dir = tmp / "exports_test"
-            exports_dir.mkdir()
-            (exports_dir / "a.md").write_text("md content", encoding="utf-8")
-            (exports_dir / "b.txt").write_text("txt content", encoding="utf-8")
-            (exports_dir / "c.json").write_text("{}", encoding="utf-8")  # ignored pattern
-
-            with patch("council_bot.REPO_ROOT", tmp), patch.dict(
-                "os.environ", {}, clear=False
-            ):
+    def test_default_picks_a_random_conversation_from_the_db(self):
+        db_path = make_raw_conversations_db([
+            ("claude", "conv-1", "Test Conversation", "api_json", SAMPLE_CLAUDE_RAW),
+        ])
+        try:
+            with patch.dict("os.environ", {}, clear=False):
                 import os as _os
-
                 _os.environ.pop("COUNCIL_CONTEXT_FILE", None)
-                text, n_files = load_context()
+                text, n_files = load_context(db_path=db_path)
+            self.assertEqual(n_files, 1)
+            self.assertIn("distinctive marker XYZ", text)
+            self.assertIn("Test Conversation", text)
+        finally:
+            Path(db_path).unlink()
 
-            self.assertEqual(n_files, 2)
-            self.assertIn("md content", text)
-            self.assertIn("txt content", text)
-            self.assertNotIn("{}", text)
+    def test_excludes_markdown_reconstructed_rows(self):
+        # Different, simplified raw_json shape (see migrate_md_to_sqlite.py) --
+        # render_conversation() can't render it, so pick_random_conversation()
+        # must never select one.
+        db_path = make_raw_conversations_db([
+            ("claude", "conv-old", "Old backfilled chat", "markdown_reconstructed",
+             {"title": "Old backfilled chat", "messages": [{"role": "human", "text": "hi"}]}),
+        ])
+        try:
+            with patch.dict("os.environ", {}, clear=False):
+                import os as _os
+                _os.environ.pop("COUNCIL_CONTEXT_FILE", None)
+                text, n_files = load_context(db_path=db_path)
+            self.assertEqual((text, n_files), ("", 0))
+        finally:
+            Path(db_path).unlink()
+
+    def test_missing_db_returns_empty_context_not_a_crash(self):
+        with patch.dict("os.environ", {}, clear=False):
+            import os as _os
+            _os.environ.pop("COUNCIL_CONTEXT_FILE", None)
+            text, n_files = load_context(db_path=str(Path(tempfile.gettempdir()) / "does_not_exist.db"))
+        self.assertEqual((text, n_files), ("", 0))
+
+    def test_render_conversation_reuses_claude_export_markdown(self):
+        markdown = render_conversation("claude", json.dumps(SAMPLE_CLAUDE_RAW))
+        self.assertIn("distinctive marker XYZ", markdown)
+        self.assertIn("Test Conversation", markdown)
+
+    def test_pick_random_conversation_only_returns_api_json_rows(self):
+        db_path = make_raw_conversations_db([
+            ("claude", "conv-1", "Keep", "api_json", SAMPLE_CLAUDE_RAW),
+            ("chatgpt", "conv-2", "Drop", "markdown_reconstructed", {"title": "Drop", "messages": []}),
+        ])
+        try:
+            for _ in range(10):  # RANDOM() -- run a few times, must never pick the excluded row
+                row = pick_random_conversation(db_path)
+                self.assertEqual(row[1], "Keep")
+        finally:
+            Path(db_path).unlink()
 
 
 class TestTgCall(unittest.TestCase):
