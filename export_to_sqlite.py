@@ -148,7 +148,7 @@ def run_claude(conn, args):
             filtered = filtered[: args.limit]
         print(f"claude: {len(filtered)} of {len(conversations)} conversations to import")
 
-        stats = {"inserted": 0, "updated": 0, "unchanged": 0, "superseded": 0, "failed": 0}
+        stats = {"inserted": 0, "updated": 0, "unchanged": 0, "superseded": 0, "failed": 0, "inserted_titles": []}
         for i, conv in enumerate(filtered, 1):
             if not cc.UUID_RE.match(conv["uuid"]):
                 continue
@@ -166,6 +166,8 @@ def run_claude(conn, args):
                 )
                 stats[outcome] += 1
                 stats["superseded"] += superseded
+                if outcome == "inserted":
+                    stats["inserted_titles"].append(data.get("name") or "(untitled)")
                 print(f"[{i}/{len(filtered)}] {outcome} ({'superseded old row, ' if superseded else ''}{data.get('name')!r})")
                 if i % args.batch_size == 0:
                     conn.commit()
@@ -190,7 +192,7 @@ def run_chatgpt(conn, args):
             filtered = filtered[: args.limit]
         print(f"chatgpt: {len(filtered)} of {len(conversations)} conversations to import (limit={args.limit})")
 
-        stats = {"inserted": 0, "updated": 0, "unchanged": 0, "superseded": 0, "failed": 0}
+        stats = {"inserted": 0, "updated": 0, "unchanged": 0, "superseded": 0, "failed": 0, "inserted_titles": []}
         for i, conv in enumerate(filtered, 1):
             if not gc.UUID_RE.match(conv["id"]):
                 continue
@@ -210,6 +212,8 @@ def run_chatgpt(conn, args):
                 )
                 stats[outcome] += 1
                 stats["superseded"] += superseded
+                if outcome == "inserted":
+                    stats["inserted_titles"].append(data.get("title") or "(untitled)")
                 print(f"[{i}/{len(filtered)}] {outcome} ({'superseded old row, ' if superseded else ''}{data.get('title')!r})")
                 if i % args.batch_size == 0:
                     conn.commit()

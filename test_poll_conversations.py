@@ -120,6 +120,44 @@ class TestPollOnceRetryOnFailure(unittest.TestCase):
         self.assertIn("claude", args[0])
         self.assertEqual(kwargs.get("priority"), "low")
 
+    def test_notify_message_lists_the_new_conversation_titles(self):
+        state = {}
+        stats = {"inserted": 2, "failed": 0, "inserted_titles": ["First chat", "Second chat"]}
+        with patch("poll_conversations.ets.run_claude", return_value=stats), \
+             patch("poll_conversations.ets.run_chatgpt", return_value={"inserted": 0, "failed": 0}), \
+             patch("poll_conversations.save_state"), \
+             patch("poll_conversations.ets.ntfy_notify") as mock_notify:
+            poll_once(self.conn, state, port=9222, overlap=OVERLAP, bootstrap_days=BOOTSTRAP_DAYS)
+        message = mock_notify.call_args[0][1]
+        self.assertIn("First chat", message)
+        self.assertIn("Second chat", message)
+
+    def test_notify_message_truncates_long_title_lists(self):
+        state = {}
+        titles = [f"chat {i}" for i in range(15)]
+        stats = {"inserted": 15, "failed": 0, "inserted_titles": titles}
+        with patch("poll_conversations.ets.run_claude", return_value=stats), \
+             patch("poll_conversations.ets.run_chatgpt", return_value={"inserted": 0, "failed": 0}), \
+             patch("poll_conversations.save_state"), \
+             patch("poll_conversations.ets.ntfy_notify") as mock_notify:
+            poll_once(self.conn, state, port=9222, overlap=OVERLAP, bootstrap_days=BOOTSTRAP_DAYS)
+        message = mock_notify.call_args[0][1]
+        self.assertIn("chat 0", message)
+        self.assertIn("+5 more", message)
+        self.assertNotIn("chat 14", message)
+
+    def test_notify_falls_back_to_plain_count_when_titles_missing(self):
+        # run_claude()/run_chatgpt() always include inserted_titles now, but
+        # notify_new() shouldn't crash if a caller's stats dict doesn't have it.
+        state = {}
+        with patch("poll_conversations.ets.run_claude", return_value={"inserted": 1, "failed": 0}), \
+             patch("poll_conversations.ets.run_chatgpt", return_value={"inserted": 0, "failed": 0}), \
+             patch("poll_conversations.save_state"), \
+             patch("poll_conversations.ets.ntfy_notify") as mock_notify:
+            poll_once(self.conn, state, port=9222, overlap=OVERLAP, bootstrap_days=BOOTSTRAP_DAYS)
+        message = mock_notify.call_args[0][1]
+        self.assertIn("added to conversations.db", message)
+
     def test_system_exit_from_missing_tab_does_not_crash_the_cycle(self):
         state = {}
         with patch("poll_conversations.ets.run_claude", side_effect=SystemExit("no tab")), \

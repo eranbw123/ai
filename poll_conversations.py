@@ -103,18 +103,31 @@ def compute_after(conn, source, state, now, *, overlap, bootstrap_days):
     return db_max if db_max is not None else (now - timedelta(days=bootstrap_days))
 
 
+MAX_TITLES_IN_NOTIFICATION = 10  # ntfy messages have no hard limit, but keep pings skimmable
+
+
 def notify_new(source, stats):
     """Silent (low-priority, no alert sound) ntfy.sh ping whenever a cycle actually
     added something new -- same topic/plumbing as export_to_sqlite.py's own
     progress notifications, and same "low = silent" convention council_bot.py
     uses for its own routine pings. Never called for a source that only saw
-    unchanged/updated rows -- just genuinely new conversations."""
+    unchanged/updated rows -- just genuinely new conversations. Lists each new
+    conversation's title (run_claude()/run_chatgpt() collect these in
+    stats["inserted_titles"]) so the ping is actually useful at a glance
+    rather than just a bare count."""
     inserted = stats.get("inserted", 0)
     if inserted <= 0:
         return
+    titles = stats.get("inserted_titles", [])
+    shown = titles[:MAX_TITLES_IN_NOTIFICATION]
+    lines = "\n".join(f"- {t}" for t in shown)
+    if len(titles) > len(shown):
+        lines += f"\n- (+{len(titles) - len(shown)} more)"
+    message = f"{inserted} new {source} conversation{'s' if inserted != 1 else ''}:\n{lines}" if lines \
+        else f"{inserted} new {source} conversation{'s' if inserted != 1 else ''} added to conversations.db"
     ets.ntfy_notify(
         f"New {source} conversation{'s' if inserted != 1 else ''}",
-        f"{inserted} new {source} conversation{'s' if inserted != 1 else ''} added to conversations.db",
+        message,
         priority="low",
         tags="speech_balloon",
     )
