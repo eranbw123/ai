@@ -1,0 +1,25 @@
+name: tests
+
+# Offline, no-secrets-needed unit tests only (test_*.py -- pure logic tests,
+# no network/Telegram/Chrome/Anthropic credentials). council_bot.py's live
+# e2e check (e2e_verify_bot.py) needs real secrets and a running Chrome tab
+# and is intentionally NOT run here -- see the council-bot-live-verification
+# project note; that one's run by hand/by Claude, not gated on every PR.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: python -m unittest discover -p "test_*.py" -v
