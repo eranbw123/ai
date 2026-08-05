@@ -20,11 +20,13 @@ from council_bot import (  # noqa: E402
     TELEGRAM_MESSAGE_LIMIT,
     REPO_ROOT,
     extract_final_call,
+    handle_message,
     js_delete_conversation,
     js_ensure_conversation,
     js_send_completion,
     js_upload_context_file,
     load_context,
+    parse_completion_result,
     run_with_heartbeat,
     tg_send_message,
 )
@@ -168,6 +170,82 @@ class TestRunWithHeartbeat(unittest.TestCase):
 
 def _raise_boom():
     raise ValueError("boom")
+
+
+class TestParseCompletionResult(unittest.TestCase):
+    def test_parses_json_string(self):
+        result = parse_completion_result('{"text": "hi", "messageLimit": null}')
+        self.assertEqual(result, {"text": "hi", "messageLimit": None})
+
+    def test_passes_through_dict_unchanged(self):
+        # Observed in the wild: some Chrome/CDP combinations hand the value
+        # back already deserialized instead of the JSON string
+        # js_send_completion's JS returns. json.loads(a_dict) raises a
+        # confusing TypeError -- this must not.
+        already_dict = {"text": "hi", "messageLimit": None}
+        self.assertEqual(parse_completion_result(already_dict), already_dict)
+
+
+class TestHandleMessage(unittest.TestCase):
+    """Offline, end-to-end-through-the-code tests of the exact wiring a
+    heartbeat-shaped bug lives in: message in -> load_context -> ask()
+    wrapped in run_with_heartbeat -> reply out. No network, no Telegram/
+    Chrome -- ask() and tg_send_message are faked -- but every line of
+    council_bot's own message-handling logic actually runs, including the
+    real threading in run_with_heartbeat.
+    """
+
+    def test_success_path_pings_heartbeat_then_sends_answer(self):
+        first_ping = threading.Event()
+        sent = []
+
+        def fake_tg_send_message(token, chat_id, text):
+            sent.append((token, chat_id, text))
+            first_ping.set()
+
+        def fake_load_context():
+            return "some context", 3
+
+        def slow_ask(question, context_text):
+            self.assertEqual(question, "my question")
+            self.assertEqual(context_text, "some context")
+            self.assertTrue(first_ping.wait(timeout=2), "heartbeat never fired")
+            return "THE CALL: do the thing"
+
+        with patch("council_bot.tg_send_message", side_effect=fake_tg_send_message):
+            handle_message(
+                "my question", slow_ask, "tok", 123,
+                load_context=fake_load_context, heartbeat_interval=0.01,
+            )
+
+        # At least one heartbeat ping, then the final answer -- in that order.
+        self.assertGreaterEqual(len(sent), 2)
+        self.assertIn("Still working on it", sent[0][2])
+        self.assertEqual(sent[-1], ("tok", 123, "THE CALL: do the thing"))
+
+    def test_ask_failure_sends_council_failed_and_does_not_raise(self):
+        def failing_ask(question, context_text):
+            raise RuntimeError("claude.ai is down")
+
+        with patch("council_bot.tg_send_message") as mock_send:
+            handle_message(
+                "my question", failing_ask, "tok", 123,
+                load_context=lambda: ("ctx", 1),
+            )
+
+        mock_send.assert_called_once_with("tok", 123, "Council failed: claude.ai is down")
+
+    def test_load_context_failure_sends_council_failed_and_does_not_raise(self):
+        def failing_load_context():
+            raise OSError("disk on fire")
+
+        with patch("council_bot.tg_send_message") as mock_send:
+            handle_message(
+                "my question", lambda q, ctx: "unused", "tok", 123,
+                load_context=failing_load_context,
+            )
+
+        mock_send.assert_called_once_with("tok", 123, "Council failed: disk on fire")
 
 
 class TestJsPayloadBuilders(unittest.TestCase):

@@ -199,6 +199,7 @@ def run_with_heartbeat(fn, token, chat_id, interval=HEARTBEAT_INTERVAL):
             elapsed = int(time.monotonic() - start)
             try:
                 tg_send_message(token, chat_id, f"Still working on it... ({elapsed}s elapsed)")
+                print(f"[heartbeat] ping sent ({elapsed}s elapsed)")
             except Exception as e:  # noqa: BLE001 -- heartbeat is best-effort
                 print(f"Heartbeat send failed: {e}", file=sys.stderr)
 
@@ -375,6 +376,21 @@ def default_log(message, err=False):
     print(message, file=sys.stderr if err else sys.stdout)
 
 
+def parse_completion_result(raw):
+    """Parse whatever conn.evaluate() handed back for js_send_completion.
+
+    js_send_completion's JS always returns `JSON.stringify({text,
+    messageLimit})` -- a string -- so this is normally just json.loads(raw).
+    But at least one Chrome/CDP combination has been observed handing the
+    value back already deserialized into a dict instead of the JSON string
+    (json.loads(a_dict) then blows up with a confusing TypeError). Accept
+    both shapes rather than crashing the whole question on it.
+    """
+    if isinstance(raw, dict):
+        return raw
+    return json.loads(raw)
+
+
 def ask_council_browser(question, context_text, port=9222, log=default_log):
     org_id = require_org_id()
     tab = cdp.find_claude_tab(port)
@@ -415,7 +431,7 @@ def ask_council_browser(question, context_text, port=9222, log=default_log):
                 f"{t3 - t2:.1f}s -- the Chrome tab was likely navigated/reloaded "
                 "mid-request. Leave the claude.ai tab alone while the bot is answering."
             )
-        result = json.loads(raw)
+        result = parse_completion_result(raw)
         text = result["text"]
         if result.get("messageLimit"):
             # Usage-window metadata, logged for visibility only -- never sent
@@ -430,6 +446,33 @@ def ask_council_browser(question, context_text, port=9222, log=default_log):
         return extract_final_call(text)
     finally:
         conn.close()
+
+
+def handle_message(
+    question, ask, token, chat_id, load_context=load_context, heartbeat_interval=HEARTBEAT_INTERVAL
+):
+    """Handle one incoming question end to end: load context, run the
+    council (with heartbeat pings) and send the reply -- or, on failure,
+    send "Council failed: ..." instead. Never raises; this is the per-
+    message unit main()'s loop calls, and one bad question must not take
+    down the poll loop. Split out of main() so this wiring -- the exact
+    thing a heartbeat-shaped bug lives in -- is unit-testable without a
+    live Telegram/Chrome connection. load_context/heartbeat_interval are
+    swappable purely so tests can fake/speed them up.
+    """
+    print(f"Question: {question}")
+    try:
+        context_text, n_files = load_context()
+        print(f"Context: {n_files} exported conversation(s)")
+        answer = run_with_heartbeat(
+            lambda: ask(question, context_text), token, chat_id, interval=heartbeat_interval
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"Council failed: {e}", file=sys.stderr)
+        tg_send_message(token, chat_id, f"Council failed: {e}")
+        return
+    tg_send_message(token, chat_id, answer)
+    print("Sent reply to Telegram.")
 
 
 def main():
@@ -475,20 +518,7 @@ def main():
             if message["chat"]["id"] != chat_id:
                 continue  # ignore anyone but the configured chat
 
-            question = message["text"]
-            print(f"Question: {question}")
-            try:
-                context_text, n_files = load_context()
-                print(f"Context: {n_files} exported conversation(s)")
-                answer = run_with_heartbeat(
-                    lambda: ask(question, context_text), token, chat_id
-                )
-            except Exception as e:  # noqa: BLE001
-                print(f"Council failed: {e}", file=sys.stderr)
-                tg_send_message(token, chat_id, f"Council failed: {e}")
-                continue
-            tg_send_message(token, chat_id, answer)
-            print("Sent reply to Telegram.")
+            handle_message(message["text"], ask, token, chat_id)
 
 
 if __name__ == "__main__":
