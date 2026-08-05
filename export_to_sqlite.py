@@ -29,6 +29,7 @@ Usage:
     python export_to_sqlite.py chatgpt --limit 50 --batch-size 10
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -47,6 +48,58 @@ from common import parse_date
 
 REPO_ROOT = Path(__file__).resolve().parent
 DB_PATH = REPO_ROOT / "conversations.db"
+IMPORT_LOCK_PATH = REPO_ROOT / "conversations.db.import-lock"
+
+
+class ImportLockError(RuntimeError):
+    pass
+
+
+@contextlib.contextmanager
+def import_lock(lock_path=IMPORT_LOCK_PATH):
+    """Exclusive lock held for the duration of a `python export_to_sqlite.py
+    <source>` CLI run, so two full-import invocations can never run at once.
+
+    Real incident, 2026-08-05: two separate Claude Code sessions each kicked
+    off a full ChatGPT re-import against the same live conversations.db at
+    the same time, unaware of each other -- doubling the request volume to
+    chatgpt.com and making the rate-limited/empty responses that triggered
+    the actual data-loss bug (see is_valid_conversation_payload) far more
+    likely. This lock doesn't replace that fix, but two independent
+    long-running full-import loops hammering the same source concurrently
+    was never a scenario worth allowing.
+
+    Deliberately scoped to the CLI entry point (main()) only -- NOT applied
+    to poll_conversations.py's regular calls into run_claude()/run_chatgpt(),
+    which are a separate, already-tested case: a low-volume background
+    poller coexisting with an occasional manual full import is exactly what
+    conversations.db's WAL journal mode + 60s busy_timeout were verified live
+    to handle safely (see poll_conversations.py's connect() comments). This
+    lock is about two *manual full-import runs* stacking, not about the
+    poller ever needing to wait for one.
+
+    Fails fast rather than waiting/queuing -- two full imports colliding is
+    exactly the kind of thing that should surface immediately, not run
+    silently in the background on top of each other. If a previous run
+    crashed and left this file behind, delete it by hand once you've
+    confirmed nothing else is actually running.
+    """
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise ImportLockError(
+            f"{lock_path} already exists -- another export_to_sqlite.py import appears to be "
+            f"running. If you're sure that's not the case (e.g. it crashed and left this file "
+            f"behind), delete it and try again."
+        )
+    try:
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        yield
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            lock_path.unlink()
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS raw_conversations (
@@ -141,7 +194,70 @@ def compute_content_hash(raw_obj):
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+_MESSAGES_KEY_BY_SOURCE = {"claude": "chat_messages", "chatgpt": "mapping"}
+
+
+def is_valid_conversation_payload(source, data):
+    """True if `data` looks like a real conversation object worth storing, not
+    an empty/garbage response from a flaky or rate-limited fetch.
+
+    Real incident, 2026-08-05: chatgpt.com occasionally returned an empty
+    response ({}) for a per-conversation detail fetch under load. run_chatgpt()
+    used to pass that straight to upsert() unvalidated -- and since it reads
+    conv["id"] (from the separate list-page summary) rather than data["id"] for
+    the conversation id, an empty `data` sailed through and silently overwrote
+    the existing row's raw_json with '{}'. By the time this was caught, 1441 of
+    1626 ChatGPT conversations' local copies had been destroyed this way (the
+    underlying chatgpt.com data was untouched -- only our local mirror lost
+    it). run_claude() happened to survive by accident (it indexes data["uuid"],
+    which raises on {} and gets caught as an ordinary per-item failure); this
+    check makes both paths safe on purpose instead of by luck.
+
+    Deliberately narrow: just checks the one field that would have caught the
+    actual incident (a non-empty message list), not full schema validation.
+    """
+    if not isinstance(data, dict) or not data:
+        return False
+    key = _MESSAGES_KEY_BY_SOURCE.get(source)
+    return bool(data.get(key)) if key else True
+
+
+def fetch_conversation_with_retry(fetch_fn, *, source, label, max_attempts=4, backoff_base=10):
+    """Call fetch_fn() (a zero-arg callable doing the actual per-conversation
+    CDP fetch) and retry with linear backoff (10s, 20s, 30s, ...) whenever the
+    response doesn't look like a real conversation (see
+    is_valid_conversation_payload) -- an empty/malformed response under load is
+    a real, observed failure mode (see that function's docstring), not a
+    hypothetical one. Raises RuntimeError if every attempt comes back invalid,
+    which callers should treat as an ordinary per-item failure (retry next
+    cycle), never as something to write to the db. A fetch_fn exception
+    propagates immediately without retrying here -- that already means
+    something more specific went wrong and the caller's own except handles it.
+    """
+    for attempt in range(1, max_attempts + 1):
+        data = fetch_fn()
+        if is_valid_conversation_payload(source, data):
+            return data
+        print(f"  empty/invalid response for {label} (attempt {attempt}/{max_attempts})", file=sys.stderr)
+        if attempt < max_attempts:
+            wait = backoff_base * attempt
+            print(f"  retrying {label} after {wait}s", file=sys.stderr)
+            time.sleep(wait)
+    raise RuntimeError(f"empty/invalid response for {label} after {max_attempts} attempts")
+
+
 def upsert(conn, *, source, conversation_id, title, model, created_at, updated_at, raw_obj):
+    # Defense-in-depth: fetch_conversation_with_retry() above is the primary
+    # guard, but upsert() refuses on principle too -- this is exactly the bug
+    # that silently destroyed 1441 ChatGPT conversations (see
+    # is_valid_conversation_payload's docstring), and no caller should be able
+    # to bypass it, today or in some future call site that forgets the retry
+    # wrapper. Raises rather than silently skipping so it surfaces as a loud
+    # per-item "failed" in the caller's stats, not a quiet no-op.
+    if not is_valid_conversation_payload(source, raw_obj):
+        raise ValueError(
+            f"refusing to write empty/invalid conversation payload for {source}/{conversation_id}"
+        )
     raw_json = json.dumps(raw_obj, ensure_ascii=False, indent=2)  # stored verbatim -- full raw API fidelity
     content_hash = compute_content_hash(raw_obj)  # hashed from a canonicalized copy -- see above
 
@@ -203,7 +319,10 @@ def run_claude(conn, args):
             if not cc.UUID_RE.match(conv["uuid"]):
                 continue
             try:
-                data = cconn.evaluate(cc.js_fetch_conversation(org_id, conv["uuid"]))
+                data = fetch_conversation_with_retry(
+                    lambda: cconn.evaluate(cc.js_fetch_conversation(org_id, conv["uuid"])),
+                    source="claude", label=conv["uuid"],
+                )
                 outcome, superseded = upsert(
                     conn,
                     source="claude",
@@ -251,7 +370,10 @@ def run_chatgpt(conn, args):
             if not gc.UUID_RE.match(conv["id"]):
                 continue
             try:
-                data = gconn.evaluate(gc.js_fetch_conversation(token, conv["id"]))
+                data = fetch_conversation_with_retry(
+                    lambda: gconn.evaluate(gc.js_fetch_conversation(token, conv["id"])),
+                    source="chatgpt", label=conv["id"],
+                )
                 created_at = norm_ts(gc.parse_api_timestamp(data.get("create_time")))
                 updated_at = norm_ts(gc.parse_api_timestamp(data.get("update_time")))
                 # The per-conversation detail fetch (data) returns title=null for
@@ -359,18 +481,20 @@ def main():
     sys.stdout.reconfigure(errors="replace")
     sys.stderr.reconfigure(errors="replace")
 
-    conn = sqlite3.connect(args.db)
-    conn.executescript(SCHEMA)
-    try:
-        if args.source == "claude":
-            run_claude(conn, args)
-        elif args.source == "chatgpt":
-            run_chatgpt(conn, args)
-        else:
-            changed, total = rehash_all_content_hashes(conn)
-            print(f"rehash done: {changed}/{total} rows had their content_hash recomputed")
-    finally:
-        conn.close()
+    lock_path = Path(str(args.db) + ".import-lock")
+    with import_lock(lock_path):
+        conn = sqlite3.connect(args.db)
+        conn.executescript(SCHEMA)
+        try:
+            if args.source == "claude":
+                run_claude(conn, args)
+            elif args.source == "chatgpt":
+                run_chatgpt(conn, args)
+            else:
+                changed, total = rehash_all_content_hashes(conn)
+                print(f"rehash done: {changed}/{total} rows had their content_hash recomputed")
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

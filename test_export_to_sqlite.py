@@ -6,6 +6,7 @@ connection and a throwaway in-memory db).
 import json
 import sys
 import sqlite3
+import tempfile
 import types
 import unittest
 from datetime import datetime, timezone
@@ -14,6 +15,14 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import export_to_sqlite as ets  # noqa: E402
+
+
+# A minimal but non-empty ChatGPT `mapping` -- real conversations always have
+# at least one message node; an empty mapping is exactly the shape
+# is_valid_conversation_payload() now (correctly) rejects as a bad fetch, so
+# fixtures representing a normal conversation need this instead of {}.
+FAKE_MAPPING = {"node-1": {"id": "node-1", "message": {"author": {"role": "user"},
+                                                        "content": {"parts": ["hi"]}}, "children": []}}
 
 
 class FakeCDPConnection:
@@ -55,7 +64,7 @@ class TestRunChatgptTitleFallback(unittest.TestCase):
     def test_falls_back_to_list_title_when_detail_title_is_null(self):
         list_item = {"id": "6a7362e1-8470-83eb-b822-ef415f941698", "title": "Test conversation 2",
                      "create_time": 1754411, "update_time": 1754411}
-        detail = {"id": list_item["id"], "title": None, "mapping": {}, "current_node": None,
+        detail = {"id": list_item["id"], "title": None, "mapping": FAKE_MAPPING, "current_node": None,
                    "create_time": 1754411, "update_time": 1754411}
         stats = self.run_chatgpt_with(list_item, detail)
         self.assertEqual(stats["inserted_titles"], ["Test conversation 2"])
@@ -67,7 +76,7 @@ class TestRunChatgptTitleFallback(unittest.TestCase):
     def test_prefers_detail_title_when_present(self):
         list_item = {"id": "6a700000-0000-0000-0000-000000000002", "title": "Stale list title",
                      "create_time": 1, "update_time": 1}
-        detail = {"id": list_item["id"], "title": "Fresh detail title", "mapping": {}, "current_node": None,
+        detail = {"id": list_item["id"], "title": "Fresh detail title", "mapping": FAKE_MAPPING, "current_node": None,
                    "create_time": 1, "update_time": 1}
         stats = self.run_chatgpt_with(list_item, detail)
         self.assertEqual(stats["inserted_titles"], ["Fresh detail title"])
@@ -75,7 +84,7 @@ class TestRunChatgptTitleFallback(unittest.TestCase):
     def test_untitled_fallback_when_both_are_missing(self):
         list_item = {"id": "6a700000-0000-0000-0000-000000000003", "title": None,
                      "create_time": 1, "update_time": 1}
-        detail = {"id": list_item["id"], "title": None, "mapping": {}, "current_node": None,
+        detail = {"id": list_item["id"], "title": None, "mapping": FAKE_MAPPING, "current_node": None,
                    "create_time": 1, "update_time": 1}
         stats = self.run_chatgpt_with(list_item, detail)
         self.assertEqual(stats["inserted_titles"], ["(untitled)"])
@@ -115,7 +124,7 @@ class TestUpdatedAtFiltering(unittest.TestCase):
         self.seed_existing_row("chatgpt", conv_id, old_created)
 
         list_item = {"id": conv_id, "title": "Old title", "create_time": old_created, "update_time": recent_updated}
-        detail = {"id": conv_id, "title": "Old title", "mapping": {}, "current_node": None,
+        detail = {"id": conv_id, "title": "Old title", "mapping": FAKE_MAPPING, "current_node": None,
                   "create_time": old_created, "update_time": recent_updated}
         args = types.SimpleNamespace(
             port=9222, limit=None, batch_size=10, notify=False,
@@ -137,7 +146,7 @@ class TestUpdatedAtFiltering(unittest.TestCase):
 
         list_item = {"uuid": conv_id, "name": "Old title", "created_at": old_created, "updated_at": recent_updated}
         detail = {"uuid": conv_id, "name": "Old title", "created_at": old_created, "updated_at": recent_updated,
-                  "current_leaf_message_uuid": None, "chat_messages": []}
+                  "current_leaf_message_uuid": None, "chat_messages": [{"uuid": "m1", "sender": "human", "text": "hi"}]}
         args = types.SimpleNamespace(
             port=9222, limit=None, batch_size=10, notify=False,
             after=datetime(2026, 6, 1, tzinfo=timezone.utc), before=None,
@@ -188,8 +197,8 @@ class TestContentHashStability(unittest.TestCase):
         conn = sqlite3.connect(":memory:")
         self.addCleanup(conn.close)
         conn.executescript(ets.SCHEMA)
-        first = {"id": "c1", "safe_urls": ["https://a.com", "https://b.com"]}
-        second = {"id": "c1", "safe_urls": ["https://b.com", "https://a.com"]}  # reordered, not changed
+        first = {"id": "c1", "safe_urls": ["https://a.com", "https://b.com"], "mapping": FAKE_MAPPING}
+        second = {"id": "c1", "safe_urls": ["https://b.com", "https://a.com"], "mapping": FAKE_MAPPING}  # reordered
 
         outcome1, _ = ets.upsert(conn, source="chatgpt", conversation_id="c1", title="t", model=None,
                                   created_at="2026-01-01T00:00:00+00:00", updated_at="2026-01-01T00:00:00+00:00",
@@ -247,6 +256,149 @@ class TestRehashMigration(unittest.TestCase):
         self.assertEqual(json.loads(row[0]), raw_obj)
         self.assertEqual(row[1], "t")
         self.assertEqual(row[2], "api_json")
+
+
+class TestEmptyPayloadProtection(unittest.TestCase):
+    """Regression coverage for the real incident, 2026-08-05: chatgpt.com
+    returned an empty response ({}) for some per-conversation fetches under
+    load, and run_chatgpt() -- which reads the conversation id from the
+    separate list-page summary, not from the fetched detail -- upserted that
+    empty payload as-is, silently overwriting the existing good row's
+    raw_json with '{}'. By the time it was caught, 1441 of 1626 ChatGPT
+    conversations' local copies had been destroyed this way. See
+    is_valid_conversation_payload()'s docstring for the full story."""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript(ets.SCHEMA)
+        self.addCleanup(self.conn.close)
+
+    def test_empty_dict_is_not_a_valid_payload(self):
+        self.assertFalse(ets.is_valid_conversation_payload("chatgpt", {}))
+        self.assertFalse(ets.is_valid_conversation_payload("claude", {}))
+
+    def test_payload_missing_the_messages_key_is_invalid(self):
+        self.assertFalse(ets.is_valid_conversation_payload("chatgpt", {"id": "c1", "title": "t"}))
+        self.assertFalse(ets.is_valid_conversation_payload("claude", {"uuid": "c1", "name": "t"}))
+
+    def test_payload_with_empty_messages_container_is_invalid(self):
+        self.assertFalse(ets.is_valid_conversation_payload("chatgpt", {"mapping": {}}))
+        self.assertFalse(ets.is_valid_conversation_payload("claude", {"chat_messages": []}))
+
+    def test_normal_payload_is_valid(self):
+        self.assertTrue(ets.is_valid_conversation_payload("chatgpt", {"mapping": FAKE_MAPPING}))
+        self.assertTrue(ets.is_valid_conversation_payload("claude", {"chat_messages": [{"uuid": "m1"}]}))
+
+    def test_upsert_refuses_to_insert_an_empty_payload(self):
+        with self.assertRaises(ValueError):
+            ets.upsert(self.conn, source="chatgpt", conversation_id="c1", title="t", model=None,
+                       created_at=None, updated_at=None, raw_obj={})
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM raw_conversations").fetchone()[0], 0)
+
+    def test_upsert_refuses_to_overwrite_an_existing_good_row_with_an_empty_payload(self):
+        # This is the exact shape of the incident: a row that already has real
+        # content must survive an upsert() call carrying a bad fetch, not get
+        # clobbered by it.
+        good = {"id": "c1", "mapping": FAKE_MAPPING}
+        ets.upsert(self.conn, source="chatgpt", conversation_id="c1", title="Real conversation", model=None,
+                   created_at="2026-01-01T00:00:00+00:00", updated_at="2026-01-01T00:00:00+00:00", raw_obj=good)
+
+        with self.assertRaises(ValueError):
+            ets.upsert(self.conn, source="chatgpt", conversation_id="c1", title="Real conversation", model=None,
+                       created_at="2026-01-01T00:00:00+00:00", updated_at="2026-08-05T00:00:00+00:00", raw_obj={})
+
+        row = self.conn.execute(
+            "SELECT raw_json FROM raw_conversations WHERE conversation_id = 'c1'"
+        ).fetchone()
+        self.assertEqual(json.loads(row[0]), good, "the existing good row must survive an empty-payload upsert")
+
+    def test_fetch_with_retry_returns_data_once_a_later_attempt_succeeds(self):
+        responses = iter([{}, {}, {"mapping": FAKE_MAPPING}])
+        with patch("export_to_sqlite.time.sleep") as mock_sleep:
+            data = ets.fetch_conversation_with_retry(
+                lambda: next(responses), source="chatgpt", label="conv-1",
+            )
+        self.assertEqual(data, {"mapping": FAKE_MAPPING})
+        self.assertEqual(mock_sleep.call_count, 2)  # backoff before attempts 2 and 3, none after success
+
+    def test_fetch_with_retry_raises_after_exhausting_all_attempts(self):
+        with patch("export_to_sqlite.time.sleep"):
+            with self.assertRaises(RuntimeError):
+                ets.fetch_conversation_with_retry(
+                    lambda: {}, source="chatgpt", label="conv-1", max_attempts=4,
+                )
+
+    def test_fetch_with_retry_uses_linear_backoff(self):
+        with patch("export_to_sqlite.time.sleep") as mock_sleep:
+            with self.assertRaises(RuntimeError):
+                ets.fetch_conversation_with_retry(
+                    lambda: {}, source="chatgpt", label="conv-1", max_attempts=4, backoff_base=10,
+                )
+        self.assertEqual([c.args[0] for c in mock_sleep.call_args_list], [10, 20, 30])
+
+    def test_run_chatgpt_leaves_existing_row_untouched_when_every_retry_comes_back_empty(self):
+        # End-to-end replay of the actual incident, through run_chatgpt() as a
+        # whole rather than just upsert()/fetch_conversation_with_retry() in
+        # isolation: an existing good row must come out the other side of a
+        # cycle that only ever sees empty responses for it completely
+        # unchanged, and that item must be reported as failed, never inserted
+        # or updated.
+        conv_id = "6a700000-0000-0000-0000-0000000000aa"
+        good_raw = {"id": conv_id, "mapping": FAKE_MAPPING}
+        ets.upsert(self.conn, source="chatgpt", conversation_id=conv_id, title="Real conversation", model=None,
+                   created_at="2026-01-01T00:00:00+00:00", updated_at="2026-01-01T00:00:00+00:00", raw_obj=good_raw)
+
+        list_item = {"id": conv_id, "title": "Real conversation",
+                     "create_time": "2026-01-01T00:00:00Z", "update_time": "2026-08-05T00:00:00Z"}
+        args = types.SimpleNamespace(port=9222, limit=None, batch_size=10, notify=False, after=None, before=None)
+        fake_conn = FakeCDPConnection(responses=["fake-token"] + [{}] * 4)  # every retry attempt comes back empty
+        with patch("export_to_sqlite.gc.connect", return_value=fake_conn), \
+             patch("export_to_sqlite.gc.fetch_all_conversation_summaries", return_value=[list_item]), \
+             patch("export_to_sqlite.time.sleep"):
+            stats = ets.run_chatgpt(self.conn, args)
+
+        self.assertEqual(stats["failed"], 1)
+        self.assertEqual(stats["inserted"], 0)
+        self.assertEqual(stats["updated"], 0)
+        row = self.conn.execute(
+            "SELECT raw_json FROM raw_conversations WHERE conversation_id = ?", (conv_id,)
+        ).fetchone()
+        self.assertEqual(json.loads(row[0]), good_raw, "the existing good row must survive the failed cycle")
+
+
+class TestImportLock(unittest.TestCase):
+    """import_lock() -- prevents two `python export_to_sqlite.py <source>` CLI
+    runs from stacking, which is what let two independent sessions hammer
+    chatgpt.com concurrently during the real incident (see import_lock's own
+    docstring for the full rationale)."""
+
+    def setUp(self):
+        self.lock_path = Path(tempfile.mkdtemp()) / "conversations.db.import-lock"
+        self.addCleanup(lambda: self.lock_path.unlink(missing_ok=True))
+
+    def test_second_acquire_while_held_raises(self):
+        with ets.import_lock(self.lock_path):
+            self.assertTrue(self.lock_path.exists())
+            with self.assertRaises(ets.ImportLockError):
+                with ets.import_lock(self.lock_path):
+                    pass  # pragma: no cover -- must not be reached
+
+    def test_lock_file_is_removed_after_the_with_block_exits(self):
+        with ets.import_lock(self.lock_path):
+            pass
+        self.assertFalse(self.lock_path.exists())
+
+    def test_lock_file_is_removed_even_if_the_with_block_raises(self):
+        with self.assertRaises(ValueError):
+            with ets.import_lock(self.lock_path):
+                raise ValueError("boom")
+        self.assertFalse(self.lock_path.exists())
+
+    def test_can_reacquire_after_a_clean_release(self):
+        with ets.import_lock(self.lock_path):
+            pass
+        with ets.import_lock(self.lock_path):  # must not raise -- previous lock was released
+            pass
 
 
 if __name__ == "__main__":
