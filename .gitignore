@@ -2,3 +2,5 @@
 exports**/
 __pycache__/
 .venv/
+poll_state.json
+poll_conversations.log

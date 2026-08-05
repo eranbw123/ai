@@ -6,8 +6,10 @@ council reply), in two modes sharing one round-trip-detection core.
     council_bot.py as a subprocess pointed at a small local fake Telegram
     server (this file's own FakeTelegramServer) and a throwaway fake
     token/chat id, injects one synthetic message itself, and uses a lean
-    synthetic context file (a couple hundred bytes, not the repo's full
-    ~80KB exports/) to keep the round trip fast and cheap. Only the
+    synthetic context file (a couple hundred bytes, not a real conversation
+    pulled from conversations.db) to keep the round trip fast and cheap,
+    predictable, and independent of whatever happens to be in the db right
+    now. Only the
     Telegram transport and context size are faked -- COUNCIL_BACKEND,
     CLAUDE_ORG_ID etc. still come from .env.local, so it's still a real
     claude.ai/Chrome CDP generation. Never touches the real bot/chat.
@@ -216,7 +218,7 @@ def run_mock(args):
     env["TELEGRAM_API_BASE"] = f"http://127.0.0.1:{port}"
     env["TELEGRAM_BOT_TOKEN"] = FAKE_TOKEN
     env["TELEGRAM_CHAT_ID"] = str(FAKE_CHAT_ID)
-    env["COUNCIL_CONTEXT_FILE"] = str(lean_context_path)  # lean: skip the real ~80KB exports/
+    env["COUNCIL_CONTEXT_FILE"] = str(lean_context_path)  # lean: skip the real db lookup
     env["PYTHONUNBUFFERED"] = "1"  # belt-and-suspenders; council_bot also forces this itself
     env["NTFY_TOPIC"] = ""  # disable pushes -- this runs often and shouldn't page the phone
 

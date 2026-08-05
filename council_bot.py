@@ -3,8 +3,10 @@
 
 Long-polls a Telegram bot for messages from one authorized chat. Each message
 becomes the council's question; the full 5-advisor + chairman deliberation
-runs against the context of every exported AI conversation under exports*/ in
-this repo, and only the Chairman's final call is sent back to Telegram.
+runs against the context of a single random past conversation (Claude or
+ChatGPT), picked from conversations.db's raw_conversations table and
+rendered from its raw API JSON -- see load_context()/pick_random_conversation()
+-- and only the Chairman's final call is sent back to Telegram.
 
 Two backends, picked by COUNCIL_BACKEND in .env.local:
   - "api"     (default) calls the Anthropic API directly. Needs
@@ -36,8 +38,11 @@ with NTFY_TOPIC/NTFY_BASE in .env.local, or set NTFY_TOPIC="" to disable.
 import glob
 import json
 import os
+import random
 import re
+import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -48,8 +53,12 @@ from pathlib import Path
 import anthropic
 
 import cdp
+from chatgpt_export import convert_to_markdown as chatgpt_convert_to_markdown
+from claude_export import convert_to_markdown as claude_convert_to_markdown
 from claude_export_cdp import require_org_id
 from common import REPO_ROOT, load_env_local
+
+DB_PATH = REPO_ROOT / "conversations.db"
 
 # When stdout/stderr are redirected to a file (e.g. `python council_bot.py >>
 # council_bot.log`), Windows makes Python fall back to the console's ANSI
@@ -106,11 +115,11 @@ You are going to run an "LLM Council" deliberation on a question, entirely on yo
 simulating five independent advisors and a chairman. Follow the three stages exactly, doing \
 all of the work internally in your reasoning.
 
-You also have access to the person's exported AI conversation history (Claude and ChatGPT \
-chats) as context -- either inline below or as an attached file named \
-exported_conversations.txt. Use it whenever it's relevant to the question — for example, if \
-asked to surface interesting threads to explore further, mine this history for genuinely \
-underexplored or intriguing questions rather than inventing generic ones.
+You also have access to one randomly-sampled past conversation (Claude or ChatGPT) as context -- \
+either inline below or as an attached file named exported_conversations.txt. Treat it as a \
+sample of the kind of things this person actually talks about, not an exhaustive history -- use \
+it whenever it's relevant to the question, e.g. to ground a generic answer in something concrete \
+about them, but don't assume it covers the topic at hand.
 
 THE FIVE ADVISORS (each is a distinct persona — stay fully in character, do not let them agree \
 by default):
@@ -150,11 +159,42 @@ list — sized to fit a phone screen>\
 """
 
 
-def load_context():
-    # POC scoping: point at a single export file or a single exports*/
-    # subdirectory instead of globbing all of them (useful to scope context
-    # down -- e.g. to just the last couple of days -- without touching the
-    # full export history under exports*/).
+def pick_random_conversation(db_path=None):
+    """One random row from raw_conversations, restricted to raw_source='api_json'
+    (true raw API JSON). markdown_reconstructed rows (backfilled from old
+    exports*/*.md files, see migrate_md_to_sqlite.py) store a different,
+    simplified shape ({title, messages: [{role, text}]}) that
+    render_conversation() below can't render, so they're excluded here rather
+    than silently producing an empty conversation. Returns a (source, title,
+    raw_json) row, or None if the db doesn't exist yet / has no such rows."""
+    path = Path(db_path) if db_path else DB_PATH
+    if not path.exists():
+        return None
+    conn = sqlite3.connect(str(path))
+    try:
+        return conn.execute(
+            "SELECT source, title, raw_json FROM raw_conversations "
+            "WHERE raw_source = 'api_json' ORDER BY RANDOM() LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def render_conversation(source, raw_json):
+    """Reuses the exact same renderer the old exports*/*.md files were written
+    with (claude_export.py's/chatgpt_export.py's convert_to_markdown), so this
+    produces the identical format -- just sourced from the db instead of a
+    file that was exported to disk ahead of time."""
+    data = json.loads(raw_json)
+    convert = claude_convert_to_markdown if source == "claude" else chatgpt_convert_to_markdown
+    return convert(data, include_metadata=True)
+
+
+def load_context(db_path=None):
+    # POC scoping: point at a single file or directory of exported
+    # conversations instead of the random single-conversation default below
+    # -- e2e_verify_bot.py's mock mode uses this to get a small, fixed
+    # context instead of a real db lookup.
     scoped = os.environ.get("COUNCIL_CONTEXT_FILE")
     if scoped:
         path = Path(scoped)
@@ -174,15 +214,34 @@ def load_context():
         text = path.read_text(encoding="utf-8", errors="replace")
         return f"=== {path.relative_to(REPO_ROOT)} ===\n{text}", 1
 
-    paths = sorted(
-        p for pattern in ("exports*/**/*.md", "exports*/**/*.txt")
-        for p in glob.glob(str(REPO_ROOT / pattern), recursive=True)
-    )
-    parts = []
-    for p in paths:
-        text = Path(p).read_text(encoding="utf-8", errors="replace")
-        parts.append(f"=== {Path(p).relative_to(REPO_ROOT)} ===\n{text}")
-    return "\n\n".join(parts), len(paths)
+    try:
+        row = pick_random_conversation(db_path)
+    except sqlite3.OperationalError as e:
+        # Best-effort: a concurrent writer (e.g. poll_conversations.py, or a
+        # manual export_to_sqlite.py run) can transiently lock the db. Missing
+        # context for one question beats failing the whole question over
+        # something this inessential.
+        print(f"load_context: db lookup failed ({e}), continuing without context", file=sys.stderr)
+        return "", 0
+    if row is None:
+        return "", 0
+    source, title, raw_json = row
+    markdown = render_conversation(source, raw_json)
+
+    # Write the rendered conversation to a scratch file and read it back --
+    # keeps "context comes from a file on disk" the same shape it always was
+    # (and the shape ask_council_browser's file-upload path expects), without
+    # persisting anything in the repo -- deleted immediately after, regardless
+    # of outcome.
+    fd, tmp_path = tempfile.mkstemp(prefix="council_context_", suffix=".md")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(markdown)
+        text = Path(tmp_path).read_text(encoding="utf-8")
+    finally:
+        os.unlink(tmp_path)
+
+    return f"=== random {source} conversation: {title or '(untitled)'} ===\n{text}", 1
 
 
 def tg_call(token, method, params=None, timeout=POLL_TIMEOUT + 10):
