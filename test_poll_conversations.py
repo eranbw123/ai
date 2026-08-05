@@ -15,7 +15,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from poll_conversations import (  # noqa: E402
     compute_after,
-    db_max_created_at,
+    db_max_updated_at,
     load_state,
     poll_once,
     save_state,
@@ -33,12 +33,12 @@ class TestComputeAfter(unittest.TestCase):
         self.conn.executescript(ets.SCHEMA)
         self.addCleanup(self.conn.close)
 
-    def insert(self, source, conv_id, created_at):
+    def insert(self, source, conv_id, created_at, updated_at=None):
         self.conn.execute(
             """INSERT INTO raw_conversations
                (source, conversation_id, title, created_at, updated_at, raw_json, raw_source, content_hash)
                VALUES (?, ?, 't', ?, ?, '{}', 'api_json', 'h')""",
-            (source, conv_id, created_at, created_at),
+            (source, conv_id, created_at, updated_at if updated_at is not None else created_at),
         )
         self.conn.commit()
 
@@ -52,6 +52,17 @@ class TestComputeAfter(unittest.TestCase):
         self.insert("claude", "c2", (NOW - timedelta(days=3)).isoformat())
         after = compute_after(self.conn, "claude", {}, NOW, overlap=OVERLAP, bootstrap_days=BOOTSTRAP_DAYS)
         self.assertEqual(after, datetime.fromisoformat(recent))
+
+    def test_bootstrap_uses_updated_at_not_created_at(self):
+        # A conversation created long ago but updated recently (someone continued
+        # an old chat) must anchor the bootstrap window on its updated_at, not its
+        # (much older) created_at -- otherwise a fresh poller would immediately
+        # think it's outside the --bootstrap-days window and skip re-checking it.
+        old_created = (NOW - timedelta(days=30)).isoformat()
+        recent_updated = (NOW - timedelta(hours=1)).isoformat()
+        self.insert("claude", "c1", old_created, updated_at=recent_updated)
+        after = compute_after(self.conn, "claude", {}, NOW, overlap=OVERLAP, bootstrap_days=BOOTSTRAP_DAYS)
+        self.assertEqual(after, datetime.fromisoformat(recent_updated))
 
     def test_sources_are_independent(self):
         self.insert("claude", "c1", (NOW - timedelta(days=1)).isoformat())
@@ -72,9 +83,9 @@ class TestComputeAfter(unittest.TestCase):
         after = compute_after(self.conn, "claude", state, NOW, overlap=OVERLAP, bootstrap_days=BOOTSTRAP_DAYS)
         self.assertEqual(after, last_success)
 
-    def test_db_max_created_at_ignores_other_source(self):
+    def test_db_max_updated_at_ignores_other_source(self):
         self.insert("chatgpt", "g1", (NOW - timedelta(days=1)).isoformat())
-        self.assertIsNone(db_max_created_at(self.conn, "claude"))
+        self.assertIsNone(db_max_updated_at(self.conn, "claude"))
 
 
 class TestPollOnceRetryOnFailure(unittest.TestCase):

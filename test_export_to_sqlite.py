@@ -7,6 +7,7 @@ import sys
 import sqlite3
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -39,6 +40,7 @@ class TestRunChatgptTitleFallback(unittest.TestCase):
     def setUp(self):
         self.conn = sqlite3.connect(":memory:")
         self.conn.executescript(ets.SCHEMA)
+        self.addCleanup(self.conn.close)
 
     def run_chatgpt_with(self, list_item, detail_response):
         fake_conn = FakeCDPConnection(responses=["fake-token", detail_response])
@@ -76,6 +78,76 @@ class TestRunChatgptTitleFallback(unittest.TestCase):
                    "create_time": 1, "update_time": 1}
         stats = self.run_chatgpt_with(list_item, detail)
         self.assertEqual(stats["inserted_titles"], ["(untitled)"])
+
+
+class TestUpdatedAtFiltering(unittest.TestCase):
+    """Regression coverage for a real bug: a conversation that was already
+    imported but later gets a new message must be re-synced, not permanently
+    skipped once --after moves past its (unchanged) created_at. run_claude()/
+    run_chatgpt() must filter candidates by updated_at, not created_at --
+    upsert()'s content_hash comparison only ever gets a chance to run if the
+    conversation isn't thrown away by the filter first.
+
+    Each test's --after sits strictly after the old created_at but at/before
+    the recent updated_at: filtering by "created" would exclude the
+    conversation entirely (stats would stay all-zero, item never reaches
+    upsert()); filtering by "updated" (the fix) includes it."""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript(ets.SCHEMA)
+        self.addCleanup(self.conn.close)
+
+    def seed_existing_row(self, source, conv_id, old_created_at):
+        self.conn.execute(
+            """INSERT INTO raw_conversations
+               (source, conversation_id, title, created_at, updated_at,
+                raw_json, raw_source, content_hash)
+               VALUES (?, ?, 'Old title', ?, ?, '{"old": true}', 'api_json', 'stale-hash')""",
+            (source, conv_id, old_created_at, old_created_at),
+        )
+        self.conn.commit()
+
+    def test_chatgpt_resyncs_old_conversation_that_was_recently_updated(self):
+        conv_id = "6a700000-0000-0000-0000-000000000010"
+        old_created, recent_updated = "2026-01-01T00:00:00Z", "2026-08-05T12:00:00Z"
+        self.seed_existing_row("chatgpt", conv_id, old_created)
+
+        list_item = {"id": conv_id, "title": "Old title", "create_time": old_created, "update_time": recent_updated}
+        detail = {"id": conv_id, "title": "Old title", "mapping": {}, "current_node": None,
+                  "create_time": old_created, "update_time": recent_updated}
+        args = types.SimpleNamespace(
+            port=9222, limit=None, batch_size=10, notify=False,
+            after=datetime(2026, 6, 1, tzinfo=timezone.utc), before=None,
+        )
+        fake_conn = FakeCDPConnection(responses=["fake-token", detail])
+        with patch("export_to_sqlite.gc.connect", return_value=fake_conn), \
+             patch("export_to_sqlite.gc.fetch_all_conversation_summaries", return_value=[list_item]):
+            stats = ets.run_chatgpt(self.conn, args)
+
+        self.assertEqual(stats["updated"] + stats["inserted"], 1, "conversation was wrongly filtered out")
+        self.assertEqual(stats["updated"], 1)  # already existed -> updated, not inserted
+
+    def test_claude_resyncs_old_conversation_that_was_recently_updated(self):
+        conv_id = "6a700000-0000-4000-8000-000000000011"
+        old_created, recent_updated = "2026-01-01T00:00:00.000000Z", "2026-08-05T12:00:00.000000Z"
+        self.seed_existing_row("claude", conv_id, old_created)
+
+        list_item = {"uuid": conv_id, "name": "Old title", "created_at": old_created, "updated_at": recent_updated}
+        detail = {"uuid": conv_id, "name": "Old title", "created_at": old_created, "updated_at": recent_updated,
+                  "current_leaf_message_uuid": None, "chat_messages": []}
+        args = types.SimpleNamespace(
+            port=9222, limit=None, batch_size=10, notify=False,
+            after=datetime(2026, 6, 1, tzinfo=timezone.utc), before=None,
+        )
+        fake_conn = FakeCDPConnection(responses=[detail])
+        with patch("export_to_sqlite.cc.require_org_id", return_value="6a700000-0000-4000-8000-000000000000"), \
+             patch("export_to_sqlite.cc.connect", return_value=fake_conn), \
+             patch("export_to_sqlite.cc.fetch_all_conversation_summaries", return_value=[list_item]):
+            stats = ets.run_claude(self.conn, args)
+
+        self.assertEqual(stats["updated"] + stats["inserted"], 1, "conversation was wrongly filtered out")
+        self.assertEqual(stats["updated"], 1)
 
 
 if __name__ == "__main__":

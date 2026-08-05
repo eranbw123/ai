@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Continuously poll Claude and ChatGPT for new conversations and load them
-into conversations.db -- the "auto conversation update" mechanism.
+"""Continuously poll Claude and ChatGPT for new AND updated conversations and
+load them into conversations.db -- the "auto conversation update" mechanism.
 
 Runs forever, one poll cycle every --interval seconds (default 60). Each
 cycle calls straight into export_to_sqlite.py's run_claude()/run_chatgpt(),
@@ -10,6 +10,15 @@ conversation_id), a content_hash to skip no-op rewrites, and the
 markdown_reconstructed-supersede logic. Nothing new to dedupe here -- this
 script's only job is deciding *what date range to ask for* each cycle.
 
+That date range is compared against updated_at, not created_at (see
+export_to_sqlite.py's module docstring) -- so a conversation you already had
+that gets a new message shows up here too, re-fetched and re-upserted (a
+cheap "unchanged" no-op via content_hash if nothing actually changed since
+the last check). Filtering by created_at alone would mean an old
+conversation's new messages are never seen again once its --after window
+moves past its creation date -- caught live: a real conversation continued
+after its initial import went completely unsynced until this was fixed.
+
 Catch-up window ("--after"), per source, independently:
   - Steady state: min(last successful poll's timestamp, now - --overlap).
     --overlap (default 2 minutes) is intentionally wider than --interval so
@@ -17,7 +26,7 @@ Catch-up window ("--after"), per source, independently:
     a conversation already in the DB is a cheap no-op (content_hash match),
     so overlap costs nothing but guarantees nothing is missed.
   - First run ever for a source (no state recorded yet): the most recent
-    created_at already in raw_conversations for that source, so we pick up
+    updated_at already in raw_conversations for that source, so we pick up
     exactly where the last manual/full import left off. If that source has
     no rows at all yet, fall back to --bootstrap-days (default 7) back.
   - Down for a while (process was killed, laptop slept, Chrome tab closed):
@@ -85,9 +94,9 @@ def save_state(state):
     tmp.replace(STATE_PATH)  # atomic on both POSIX and Windows
 
 
-def db_max_created_at(conn, source):
+def db_max_updated_at(conn, source):
     row = conn.execute(
-        "SELECT MAX(created_at) FROM raw_conversations WHERE source = ?", (source,)
+        "SELECT MAX(updated_at) FROM raw_conversations WHERE source = ?", (source,)
     ).fetchone()
     if row and row[0]:
         return datetime.fromisoformat(row[0])
@@ -95,11 +104,13 @@ def db_max_created_at(conn, source):
 
 
 def compute_after(conn, source, state, now, *, overlap, bootstrap_days):
-    """Returns the tz-aware datetime to pass as --after for this source this cycle."""
+    """Returns the tz-aware datetime to pass as --after for this source this cycle
+    -- compared against updated_at downstream (see module docstring), so this is
+    really "catch up on anything touched since X," not just "created since X.\""""
     last_success = (state.get(source) or {}).get("last_success_at")
     if last_success:
         return min(datetime.fromisoformat(last_success), now - overlap)
-    db_max = db_max_created_at(conn, source)
+    db_max = db_max_updated_at(conn, source)
     return db_max if db_max is not None else (now - timedelta(days=bootstrap_days))
 
 

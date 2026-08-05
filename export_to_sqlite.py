@@ -4,6 +4,12 @@ directly into conversations.db's raw_conversations table -- no intermediate
 markdown/json files, per the decision that source files aren't needed since
 we're going straight to SQLite.
 
+--after/--before filter on updated_at, not created_at, so a conversation
+that already existed but got a new message since --after is picked up too,
+not just brand-new ones -- upsert() below detects the actual content change
+via content_hash either way; this only controls what's considered a
+candidate in the first place.
+
 Reuses the existing connect()/fetch_all_conversation_summaries()/js_fetch_conversation()
 from claude_export_cdp.py and chatgpt_export_cdp.py untouched -- only the sink
 changes (DB upsert instead of write_export() to a file).
@@ -143,7 +149,15 @@ def run_claude(conn, args):
     cconn = cc.connect(args.port)
     try:
         conversations = cc.fetch_all_conversation_summaries(cconn, org_id, after=args.after)
-        filtered = claude_filter(conversations, args.after, args.before, "created", None)
+        # date_field="updated", not "created": a conversation that already existed
+        # before --after but got a new message since is still a real change we need
+        # to catch -- upsert() below already detects it correctly via content_hash,
+        # but only if it's not filtered out first. fetch_all_conversation_summaries()
+        # already pages based on updated_at (see its docstring), so this is the only
+        # place "created" was narrowing things back down. Filtering by "updated"
+        # instead means the untouched-since-last-poll majority still comes back as a
+        # cheap "unchanged" no-op (same content_hash), not wasted work.
+        filtered = claude_filter(conversations, args.after, args.before, "updated", None)
         if args.limit:
             filtered = filtered[: args.limit]
         print(f"claude: {len(filtered)} of {len(conversations)} conversations to import")
@@ -187,7 +201,8 @@ def run_chatgpt(conn, args):
     try:
         token = gconn.evaluate(gc.js_get_access_token())
         conversations = gc.fetch_all_conversation_summaries(gconn, token, after=args.after)
-        filtered = gpt_filter(conversations, args.after, args.before, "created")
+        # date_field="updated" -- see the matching comment in run_claude() above.
+        filtered = gpt_filter(conversations, args.after, args.before, "updated")
         if args.limit:
             filtered = filtered[: args.limit]
         print(f"chatgpt: {len(filtered)} of {len(conversations)} conversations to import (limit={args.limit})")
