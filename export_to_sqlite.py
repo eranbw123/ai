@@ -196,6 +196,29 @@ def compute_content_hash(raw_obj):
 
 _MESSAGES_KEY_BY_SOURCE = {"claude": "chat_messages", "chatgpt": "mapping"}
 
+# Must match council_bot.py's own conv_name = f"Council: {question}" exactly
+# (see is_council_bot_scratch_conversation()'s docstring below).
+COUNCIL_BOT_TITLE_PREFIX = "Council: "
+
+
+def is_council_bot_scratch_conversation(title):
+    """True if `title` looks like one of council_bot.py's own throwaway
+    per-question claude.ai conversations (browser backend only), rather than
+    a real conversation worth importing.
+
+    council_bot.py creates one of these for every Telegram question and
+    best-effort-deletes it when done (failures are silently swallowed, by
+    design -- cleanup must never block sending the actual answer). When that
+    delete fails or races with a poll cycle, the scratch conversation lingers
+    and used to get imported like any other conversation -- which was both
+    noise (an irrelevant "N new claude conversations" notification for pure
+    bot housekeeping) and a real correctness bug: council_bot's own
+    pick_random_conversation() samples a random past conversation as context
+    for the *next* question, so a leftover one here could hand a future
+    council deliberation its own past deliberation as "context".
+    """
+    return bool(title) and title.startswith(COUNCIL_BOT_TITLE_PREFIX)
+
 
 def is_valid_conversation_payload(source, data):
     """True if `data` looks like a real conversation object worth storing, not
@@ -323,6 +346,19 @@ def run_claude(conn, args):
                   "inserted_titles": [], "updated_titles": []}
         for i, conv in enumerate(filtered, 1):
             if not cc.UUID_RE.match(conv["uuid"]):
+                continue
+            if is_council_bot_scratch_conversation(conv.get("name")):
+                # council_bot.py's browser backend creates one of these per
+                # question (see its own conv_name) and best-effort-deletes it
+                # afterward -- when that delete fails/races, the scratch
+                # conversation lingers on claude.ai and would otherwise get
+                # imported like any other conversation. That's not just
+                # notification noise: council_bot's own pick_random_conversation()
+                # samples a random past conversation as context for the *next*
+                # question, so a leftover one here could hand a future council
+                # deliberation its own past deliberation as "context". Skip it
+                # here rather than filtering it out downstream, so it never
+                # enters conversations.db in the first place.
                 continue
             try:
                 data = fetch_conversation_with_retry(

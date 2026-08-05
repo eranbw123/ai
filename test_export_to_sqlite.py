@@ -39,6 +39,57 @@ class FakeCDPConnection:
         pass
 
 
+class TestCouncilBotScratchConversationFilter(unittest.TestCase):
+    """council_bot.py's browser backend creates one throwaway claude.ai
+    conversation per Telegram question (titled "Council: <question>") and
+    best-effort-deletes it afterward. When that delete fails/races, the
+    scratch conversation used to get imported like any other conversation --
+    both an irrelevant "N new claude conversations" notification and a real
+    correctness bug (council_bot's own pick_random_conversation() could then
+    sample a past council deliberation as context for a future one).
+    run_claude() must skip these before ever fetching/upserting them."""
+
+    def test_matches_the_exact_title_shape_council_bot_uses(self):
+        self.assertTrue(ets.is_council_bot_scratch_conversation("Council: What should I work on today?"))
+
+    def test_does_not_match_a_real_conversation_that_merely_mentions_council(self):
+        self.assertFalse(ets.is_council_bot_scratch_conversation("My City Council meeting notes"))
+        self.assertFalse(ets.is_council_bot_scratch_conversation("Notes on a council of advisors"))
+
+    def test_none_and_empty_title_do_not_match(self):
+        self.assertFalse(ets.is_council_bot_scratch_conversation(None))
+        self.assertFalse(ets.is_council_bot_scratch_conversation(""))
+
+    def test_run_claude_skips_it_without_ever_fetching_or_upserting(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.executescript(ets.SCHEMA)
+
+        scratch = {"uuid": "6a700000-0000-4000-8000-0000000000cc", "name": "Council: test question",
+                   "created_at": "2026-01-01T00:00:00.000000Z", "updated_at": "2026-01-01T00:00:00.000000Z"}
+        real = {"uuid": "6a700000-0000-4000-8000-0000000000dd", "name": "A real conversation",
+                "created_at": "2026-01-01T00:00:00.000000Z", "updated_at": "2026-01-01T00:00:00.000000Z"}
+        detail = {"uuid": real["uuid"], "name": real["name"], "created_at": real["created_at"],
+                   "updated_at": real["updated_at"], "current_leaf_message_uuid": None,
+                   "chat_messages": [{"uuid": "m1", "sender": "human", "text": "hi"}]}
+        args = types.SimpleNamespace(port=9222, limit=None, batch_size=10, notify=False, after=None, before=None)
+        # Only one CDP response queued -- if run_claude() tried to fetch the
+        # scratch conversation too, this would raise IndexError (pop from
+        # empty list) and fail the test.
+        fake_conn = FakeCDPConnection(responses=[detail])
+        with patch("export_to_sqlite.cc.require_org_id", return_value="6a700000-0000-4000-8000-000000000000"), \
+             patch("export_to_sqlite.cc.connect", return_value=fake_conn), \
+             patch("export_to_sqlite.cc.fetch_all_conversation_summaries", return_value=[scratch, real]):
+            stats = ets.run_claude(conn, args)
+
+        self.assertEqual(stats["inserted"], 1)
+        self.assertEqual(stats["inserted_titles"], ["A real conversation"])
+        row = conn.execute(
+            "SELECT COUNT(*) FROM raw_conversations WHERE conversation_id = ?", (scratch["uuid"],)
+        ).fetchone()
+        self.assertEqual(row[0], 0, "the scratch conversation must never be imported")
+
+
 class TestRunChatgptTitleFallback(unittest.TestCase):
     """Regression coverage for a real bug caught live: chatgpt.com's
     per-conversation detail fetch returns title=null for conversations too
