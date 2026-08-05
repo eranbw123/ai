@@ -26,6 +26,12 @@ Setup:
        launch Chrome per claude_export_cdp.py's docstring.
     2. pip install anthropic
     3. python council_bot.py
+
+Also pushes ntfy.sh notifications (see ntfy_notify) alongside the Telegram
+traffic: low-priority/silent when a question is received and on each
+heartbeat, high-priority on failure, urgent (real banner) when the reply is
+sent -- defaults to the same topic Claude Code's own hooks use; override
+with NTFY_TOPIC/NTFY_BASE in .env.local, or set NTFY_TOPIC="" to disable.
 """
 import glob
 import json
@@ -65,6 +71,16 @@ MAX_TOKENS = 24000
 POLL_TIMEOUT = 30  # seconds, Telegram long-poll
 TELEGRAM_MESSAGE_LIMIT = 4000  # Telegram's hard cap is 4096
 HEARTBEAT_INTERVAL = 30  # seconds between "still working" pings while a question runs
+
+# Push notifications via ntfy.sh, mirroring the same topic Claude Code's own
+# Stop/Notification hooks use (see ~/.claude/settings.json) so everything
+# lands in the one ntfy app subscription. Override via NTFY_TOPIC/NTFY_BASE
+# in .env.local; set NTFY_TOPIC="" to disable entirely (e2e_verify_bot.py's
+# mock mode does this so automated test runs don't page the phone). Read at
+# call time (not a module-level constant) so both .env.local and per-process
+# env overrides -- neither loaded/set until after this module first imports
+# -- actually take effect, same reasoning as tg_call's TELEGRAM_API_BASE.
+DEFAULT_NTFY_TOPIC = "claude-code-4a93bd81fbc78f6974701714"
 
 # claude.ai's internal model slug for the browser backend (distinct from the
 # public API model IDs above) -- per cyber-wojtek/Claude-API's constants.py.
@@ -190,22 +206,45 @@ def tg_send_message(token, chat_id, text):
         tg_call(token, "sendMessage", {"chat_id": chat_id, "text": chunk})
 
 
-def run_with_heartbeat(fn, token, chat_id, interval=HEARTBEAT_INTERVAL):
-    """Call fn() (expected to block for a while) and, in parallel, send a
-    "still working" ping to Telegram every `interval` seconds until fn()
-    returns or raises. Returns fn()'s result; propagates its exception
-    unchanged. A failed heartbeat send is logged but never aborts fn()."""
+def ntfy_notify(title, message, priority="default", tags=None):
+    """Best-effort push notification via ntfy.sh. Never raises -- a failed
+    push must not take down the poll loop or a council run. No-ops if
+    NTFY_TOPIC is set to empty (explicitly disabled)."""
+    topic = os.environ.get("NTFY_TOPIC", DEFAULT_NTFY_TOPIC)
+    if not topic:
+        return
+    base = os.environ.get("NTFY_BASE", "https://ntfy.sh")
+    url = f"{base}/{topic}"
+    headers = {"Title": title, "Priority": priority}
+    if tags:
+        headers["Tags"] = tags
+    req = urllib.request.Request(url, data=message.encode("utf-8"), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception as e:  # noqa: BLE001 -- push notifications are best-effort
+        print(f"ntfy notify failed: {e}", file=sys.stderr)
+
+
+def run_with_heartbeat(fn, interval=HEARTBEAT_INTERVAL):
+    """Call fn() (expected to block for a while) and, in parallel, push a
+    low-priority "still working" ntfy notification every `interval` seconds
+    until fn() returns or raises -- silent by design (see ntfy_notify), so
+    this no longer spams the Telegram chat itself. Returns fn()'s result;
+    propagates its exception unchanged."""
     stop = threading.Event()
     start = time.monotonic()
 
     def heartbeat_loop():
         while not stop.wait(interval):
             elapsed = int(time.monotonic() - start)
-            try:
-                tg_send_message(token, chat_id, f"Still working on it... ({elapsed}s elapsed)")
-                print(f"[heartbeat] ping sent ({elapsed}s elapsed)")
-            except Exception as e:  # noqa: BLE001 -- heartbeat is best-effort
-                print(f"Heartbeat send failed: {e}", file=sys.stderr)
+            ntfy_notify(
+                "Council still working",
+                f"Still working on it... ({elapsed}s elapsed)",
+                priority="low",
+                tags="hourglass_flowing_sand",
+            )
+            print(f"[heartbeat] ping sent ({elapsed}s elapsed)")
 
     thread = threading.Thread(target=heartbeat_loop, daemon=True)
     thread.start()
@@ -452,6 +491,10 @@ def ask_council_browser(question, context_text, port=9222, log=default_log):
         conn.close()
 
 
+def _truncate_for_push(text, limit=300):
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
 def handle_message(
     question, ask, token, chat_id, load_context=load_context, heartbeat_interval=HEARTBEAT_INTERVAL
 ):
@@ -463,19 +506,30 @@ def handle_message(
     thing a heartbeat-shaped bug lives in -- is unit-testable without a
     live Telegram/Chrome connection. load_context/heartbeat_interval are
     swappable purely so tests can fake/speed them up.
+
+    Also fires ntfy.sh push notifications alongside the Telegram traffic:
+    low-priority (silent) on receipt and on each heartbeat, high-priority
+    on failure, urgent-priority (real banner) when the reply is ready --
+    the "is it done yet" moment is the one that should actually interrupt
+    you.
     """
     print(f"Question: {question}")
+    ntfy_notify(
+        "Council question received", _truncate_for_push(question), priority="low", tags="envelope",
+    )
     try:
         context_text, n_files = load_context()
         print(f"Context: {n_files} exported conversation(s)")
-        answer = run_with_heartbeat(
-            lambda: ask(question, context_text), token, chat_id, interval=heartbeat_interval
-        )
+        answer = run_with_heartbeat(lambda: ask(question, context_text), interval=heartbeat_interval)
     except Exception as e:  # noqa: BLE001
         print(f"Council failed: {e}", file=sys.stderr)
         tg_send_message(token, chat_id, f"Council failed: {e}")
+        ntfy_notify("Council failed", str(e), priority="high", tags="x")
         return
     tg_send_message(token, chat_id, answer)
+    ntfy_notify(
+        "Council reply sent", _truncate_for_push(answer), priority="urgent", tags="white_check_mark",
+    )
     print("Sent reply to Telegram.")
 
 

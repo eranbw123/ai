@@ -218,6 +218,7 @@ def run_mock(args):
     env["TELEGRAM_CHAT_ID"] = str(FAKE_CHAT_ID)
     env["COUNCIL_CONTEXT_FILE"] = str(lean_context_path)  # lean: skip the real ~80KB exports/
     env["PYTHONUNBUFFERED"] = "1"  # belt-and-suspenders; council_bot also forces this itself
+    env["NTFY_TOPIC"] = ""  # disable pushes -- this runs often and shouldn't page the phone
 
     proc = subprocess.Popen(
         [sys.executable, str(REPO_ROOT / "council_bot.py")],

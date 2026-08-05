@@ -26,6 +26,7 @@ from council_bot import (  # noqa: E402
     js_send_completion,
     js_upload_context_file,
     load_context,
+    ntfy_notify,
     parse_completion_result,
     run_with_heartbeat,
     tg_send_message,
@@ -180,45 +181,46 @@ class TestTgSendMessage(unittest.TestCase):
 
 
 class TestRunWithHeartbeat(unittest.TestCase):
-    def test_pings_telegram_while_fn_is_still_running(self):
+    def test_pushes_ntfy_while_fn_is_still_running(self):
         first_ping = threading.Event()
         calls = []
 
-        def fake_tg_send_message(token, chat_id, text):
-            calls.append((token, chat_id, text))
+        def fake_ntfy_notify(title, message, priority="default", tags=None):
+            calls.append((title, message, priority, tags))
             first_ping.set()
 
         def slow_fn():
             self.assertTrue(first_ping.wait(timeout=2), "heartbeat never fired")
             return "the answer"
 
-        with patch("council_bot.tg_send_message", side_effect=fake_tg_send_message):
-            result = run_with_heartbeat(slow_fn, "tok", 123, interval=0.01)
+        with patch("council_bot.ntfy_notify", side_effect=fake_ntfy_notify):
+            result = run_with_heartbeat(slow_fn, interval=0.01)
 
         self.assertEqual(result, "the answer")
         self.assertGreaterEqual(len(calls), 1)
-        token, chat_id, text = calls[0]
-        self.assertEqual((token, chat_id), ("tok", 123))
-        self.assertIn("Still working on it", text)
+        title, message, priority, tags = calls[0]
+        self.assertEqual(title, "Council still working")
+        self.assertIn("Still working on it", message)
+        self.assertEqual(priority, "low")  # silent -- must not bank a real banner
 
     def test_no_ping_and_no_hang_when_fn_finishes_before_first_interval(self):
-        with patch("council_bot.tg_send_message") as mock_send:
+        with patch("council_bot.ntfy_notify") as mock_notify:
             start = time.monotonic()
-            result = run_with_heartbeat(lambda: "fast result", "tok", 123, interval=10)
+            result = run_with_heartbeat(lambda: "fast result", interval=10)
             elapsed = time.monotonic() - start
 
         self.assertEqual(result, "fast result")
-        mock_send.assert_not_called()
+        mock_notify.assert_not_called()
         self.assertLess(elapsed, 2)  # must not block for the full interval
 
     def test_propagates_exception_and_stops_heartbeat_thread(self):
-        with patch("council_bot.tg_send_message") as mock_send:
+        with patch("council_bot.ntfy_notify") as mock_notify:
             before = threading.active_count()
             with self.assertRaisesRegex(ValueError, "boom"):
-                run_with_heartbeat(_raise_boom, "tok", 123, interval=10)
+                run_with_heartbeat(_raise_boom, interval=10)
             after = threading.active_count()
 
-        mock_send.assert_not_called()
+        mock_notify.assert_not_called()
         self.assertEqual(before, after)  # heartbeat thread cleaned up, not leaked
 
 
@@ -250,12 +252,17 @@ class TestHandleMessage(unittest.TestCase):
     """
 
     def test_success_path_pings_heartbeat_then_sends_answer(self):
-        first_ping = threading.Event()
+        first_heartbeat_push = threading.Event()
         sent = []
+        pushed = []
 
         def fake_tg_send_message(token, chat_id, text):
             sent.append((token, chat_id, text))
-            first_ping.set()
+
+        def fake_ntfy_notify(title, message, priority="default", tags=None):
+            pushed.append((title, message, priority, tags))
+            if title == "Council still working":
+                first_heartbeat_push.set()
 
         def fake_load_context():
             return "some context", 3
@@ -263,43 +270,98 @@ class TestHandleMessage(unittest.TestCase):
         def slow_ask(question, context_text):
             self.assertEqual(question, "my question")
             self.assertEqual(context_text, "some context")
-            self.assertTrue(first_ping.wait(timeout=2), "heartbeat never fired")
+            self.assertTrue(first_heartbeat_push.wait(timeout=2), "heartbeat never fired")
             return "THE CALL: do the thing"
 
-        with patch("council_bot.tg_send_message", side_effect=fake_tg_send_message):
+        with patch("council_bot.tg_send_message", side_effect=fake_tg_send_message), \
+             patch("council_bot.ntfy_notify", side_effect=fake_ntfy_notify):
             handle_message(
                 "my question", slow_ask, "tok", 123,
                 load_context=fake_load_context, heartbeat_interval=0.01,
             )
 
-        # At least one heartbeat ping, then the final answer -- in that order.
-        self.assertGreaterEqual(len(sent), 2)
-        self.assertIn("Still working on it", sent[0][2])
-        self.assertEqual(sent[-1], ("tok", 123, "THE CALL: do the thing"))
+        # Only the final answer goes to Telegram -- heartbeat pings moved to ntfy.
+        self.assertEqual(sent, [("tok", 123, "THE CALL: do the thing")])
+
+        # ntfy: received (low), >=1 heartbeat (low), reply sent (urgent) -- in order.
+        titles = [p[0] for p in pushed]
+        priorities = [p[2] for p in pushed]
+        self.assertEqual(titles[0], "Council question received")
+        self.assertEqual(priorities[0], "low")
+        self.assertIn("Council still working", titles)
+        self.assertEqual(titles[-1], "Council reply sent")
+        self.assertEqual(priorities[-1], "urgent")
 
     def test_ask_failure_sends_council_failed_and_does_not_raise(self):
         def failing_ask(question, context_text):
             raise RuntimeError("claude.ai is down")
 
-        with patch("council_bot.tg_send_message") as mock_send:
+        with patch("council_bot.tg_send_message") as mock_send, \
+             patch("council_bot.ntfy_notify") as mock_notify:
             handle_message(
                 "my question", failing_ask, "tok", 123,
                 load_context=lambda: ("ctx", 1),
             )
 
         mock_send.assert_called_once_with("tok", 123, "Council failed: claude.ai is down")
+        failure_calls = [c for c in mock_notify.call_args_list if c.args[0] == "Council failed"]
+        self.assertEqual(len(failure_calls), 1)
+        self.assertEqual(failure_calls[0].kwargs.get("priority"), "high")
 
     def test_load_context_failure_sends_council_failed_and_does_not_raise(self):
         def failing_load_context():
             raise OSError("disk on fire")
 
-        with patch("council_bot.tg_send_message") as mock_send:
+        with patch("council_bot.tg_send_message") as mock_send, \
+             patch("council_bot.ntfy_notify"):
             handle_message(
                 "my question", lambda q, ctx: "unused", "tok", 123,
                 load_context=failing_load_context,
             )
 
         mock_send.assert_called_once_with("tok", 123, "Council failed: disk on fire")
+
+
+class TestNtfyNotify(unittest.TestCase):
+    def test_posts_to_configured_topic_with_headers(self):
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b""
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["headers"] = req.headers
+            captured["data"] = req.data
+            return FakeResponse()
+
+        with patch.dict("os.environ", {"NTFY_TOPIC": "my-topic", "NTFY_BASE": "http://127.0.0.1:9"}):
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                ntfy_notify("Title", "body text", priority="urgent", tags="bell")
+
+        self.assertEqual(captured["url"], "http://127.0.0.1:9/my-topic")
+        self.assertEqual(captured["headers"]["Title"], "Title")
+        self.assertEqual(captured["headers"]["Priority"], "urgent")
+        self.assertEqual(captured["headers"]["Tags"], "bell")
+        self.assertEqual(captured["data"], b"body text")
+
+    def test_empty_topic_disables_and_makes_no_request(self):
+        with patch.dict("os.environ", {"NTFY_TOPIC": ""}):
+            with patch("urllib.request.urlopen") as mock_urlopen:
+                ntfy_notify("Title", "body")
+        mock_urlopen.assert_not_called()
+
+    def test_network_failure_is_swallowed_not_raised(self):
+        with patch.dict("os.environ", {"NTFY_TOPIC": "my-topic"}):
+            with patch("urllib.request.urlopen", side_effect=OSError("no network")):
+                ntfy_notify("Title", "body")  # must not raise
 
 
 class TestJsPayloadBuilders(unittest.TestCase):
