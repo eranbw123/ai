@@ -12,3 +12,7 @@ server.log
 poll_state.json
 poll_conversations.log
 poll_conversations.err.log
+*.log
+*.log.pre-move
+*.err.log
+*.err.log.pre-move

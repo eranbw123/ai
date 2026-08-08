@@ -27,6 +27,7 @@ Dedup / supersede logic:
 Usage:
     python export_to_sqlite.py claude
     python export_to_sqlite.py chatgpt --limit 50 --batch-size 10
+    python export_to_sqlite.py chatgpt --max-runtime-minutes 25  # bail cleanly after 25m, rerun to resume
 """
 import argparse
 import contextlib
@@ -37,6 +38,7 @@ import sqlite3
 import sys
 import time
 import urllib.request
+from collections import deque
 from datetime import timezone
 from pathlib import Path
 
@@ -150,6 +152,52 @@ def norm_ts(dt):
     return dt.astimezone(timezone.utc).isoformat() if dt else None
 
 
+def progress_summary(i, total, start_time, stats):
+    """Human-readable 'Nm elapsed, X.X/min, ~Ym left, R retries so far' fragment
+    for notifications -- built once here so the starting/progress/stopped/done
+    messages all report the same numbers the same way.
+
+    rate is computed from wall-clock elapsed time, not a fixed per-item
+    estimate, specifically so it reflects real throttling (chatgpt.com making
+    every fetch_conversation_with_retry() call burn through several 10/20/30s
+    backoff waits) rather than looking artificially healthy.
+    """
+    elapsed_min = (time.monotonic() - start_time) / 60
+    rate = i / elapsed_min if elapsed_min > 0 else 0
+    remaining = total - i
+    eta = f", ~{remaining / rate:.0f}m left" if rate > 0 else ""
+    return (f"{elapsed_min:.0f}m elapsed, {rate:.1f}/min{eta}, "
+            f"{stats.get('retries', 0)} retries so far")
+
+
+def adaptive_pace(recent_retry_counts, *, base=0.5, max_retries=3):
+    """Seconds to sleep before the next detail fetch, scaled to how much
+    retrying the last few items needed -- eases off chatgpt.com's rate
+    limiter instead of hammering it at the same flat cadence regardless of
+    how throttled it obviously already is.
+
+    Real incident, 2026-08-05/06: repeated same-day full-history passes (see
+    fetch_conversation_with_retry's docstring) degraded chatgpt.com's
+    response rate from 0 retries needed across 1625 items (the first pass of
+    the day) to nearly every single item needing 3/3 retries by the next
+    morning, at a flat 0.5s pace throughout -- the pace never adapted to the
+    obviously-worsening throttling, so the run kept adding to the same
+    pressure that caused it. `recent_retry_counts` holds each of the last
+    handful of items' retry count (0..max_retries); once the recent average
+    gets close to max_retries (nearly everything failing until the last
+    attempt), that's not noise to retry through faster, it's a clear signal
+    to slow down harder.
+    """
+    if not recent_retry_counts:
+        return base
+    avg = sum(recent_retry_counts) / len(recent_retry_counts)
+    if avg >= max_retries * 0.75:
+        return 20.0
+    if avg >= max_retries * 0.4:
+        return 5.0
+    return base
+
+
 def find_chatgpt_model(data):
     for node in (data.get("mapping") or {}).values():
         msg = node.get("message") or {}
@@ -245,7 +293,7 @@ def is_valid_conversation_payload(source, data):
     return bool(data.get(key)) if key else True
 
 
-def fetch_conversation_with_retry(fetch_fn, *, source, label, max_attempts=4, backoff_base=10):
+def fetch_conversation_with_retry(fetch_fn, *, source, label, stats=None, max_attempts=4, backoff_base=10):
     """Call fetch_fn() (a zero-arg callable doing the actual per-conversation
     CDP fetch) and retry with linear backoff (10s, 20s, 30s, ...) whenever the
     response doesn't look like a real conversation (see
@@ -266,6 +314,11 @@ def fetch_conversation_with_retry(fetch_fn, *, source, label, max_attempts=4, ba
     to ride out real rate-limiting, not just a glitch, and a too-short window
     trades "fast per item" for "recovers less data per pass" under load --
     reverted back to 10 for that reason.
+
+    `stats`, if given, gets stats["retries"] incremented once per retry (not
+    per attempt) -- purely so callers can report how much rate-limiting a run
+    hit (see run_chatgpt()'s progress notifications), without changing what
+    gets raised/returned here.
     """
     for attempt in range(1, max_attempts + 1):
         data = fetch_fn()
@@ -275,6 +328,8 @@ def fetch_conversation_with_retry(fetch_fn, *, source, label, max_attempts=4, ba
         if attempt < max_attempts:
             wait = backoff_base * attempt
             print(f"  retrying {label} after {wait}s", file=sys.stderr)
+            if stats is not None:
+                stats["retries"] = stats.get("retries", 0) + 1
             time.sleep(wait)
     raise RuntimeError(f"empty/invalid response for {label} after {max_attempts} attempts")
 
@@ -345,10 +400,17 @@ def run_claude(conn, args):
         if args.limit:
             filtered = filtered[: args.limit]
         print(f"claude: {len(filtered)} of {len(conversations)} conversations to import")
+        max_runtime_minutes = getattr(args, "max_runtime_minutes", None)
+        deadline = time.monotonic() + max_runtime_minutes * 60 if max_runtime_minutes else None
 
-        stats = {"inserted": 0, "updated": 0, "unchanged": 0, "superseded": 0, "failed": 0,
-                  "inserted_titles": [], "updated_titles": []}
+        stats = {"inserted": 0, "updated": 0, "unchanged": 0, "superseded": 0, "failed": 0, "retries": 0,
+                  "inserted_titles": [], "updated_titles": [], "stopped_early": False}
         for i, conv in enumerate(filtered, 1):
+            if deadline is not None and time.monotonic() >= deadline:
+                stats["stopped_early"] = True
+                print(f"claude: hit --max-runtime-minutes budget ({max_runtime_minutes}m) "
+                      f"with {len(filtered) - i + 1} left -- stopping here, rerun to resume")
+                break
             if not cc.UUID_RE.match(conv["uuid"]):
                 continue
             if is_council_bot_scratch_conversation(conv.get("name")):
@@ -367,7 +429,7 @@ def run_claude(conn, args):
             try:
                 data = fetch_conversation_with_retry(
                     lambda: cconn.evaluate(cc.js_fetch_conversation(org_id, conv["uuid"])),
-                    source="claude", label=conv["uuid"],
+                    source="claude", label=conv["uuid"], stats=stats,
                 )
                 outcome, superseded = upsert(
                     conn,
@@ -409,17 +471,68 @@ def run_chatgpt(conn, args):
         if args.limit:
             filtered = filtered[: args.limit]
         print(f"chatgpt: {len(filtered)} of {len(conversations)} conversations to import (limit={args.limit})")
+        max_runtime_minutes = getattr(args, "max_runtime_minutes", None)
+        start_time = time.monotonic()
+        deadline = start_time + max_runtime_minutes * 60 if max_runtime_minutes else None
 
-        stats = {"inserted": 0, "updated": 0, "unchanged": 0, "superseded": 0, "failed": 0,
-                  "inserted_titles": [], "updated_titles": []}
+        # conversation_id -> stored updated_at, so a conversation whose list-page
+        # update_time already matches what's in the db can skip the detail fetch
+        # entirely, not just the write. upsert()'s content_hash check already
+        # made re-fetching harmless, but "harmless to write" isn't "free" -- every
+        # full resume was re-issuing a detail request for all ~1629 conversations
+        # every single time regardless of whether anything changed. Real incident,
+        # 2026-08-05/06: 7+ full passes in ~16h against the same chatgpt.com
+        # session/account (each one re-requesting the whole history) escalated
+        # chatgpt.com's throttling from 0 retries needed across 1625 items on the
+        # first pass to nearly every item needing all 3 retries by the next
+        # morning (see fetch_conversation_with_retry's and adaptive_pace's
+        # docstrings). update_time is already trusted as the staleness signal
+        # elsewhere (poll_conversations.py's compute_after, the --after/--before
+        # filtering above) -- reusing it here to skip network calls outright, not
+        # just db writes, is the same trust applied one step earlier.
+        existing_updated_at = dict(conn.execute(
+            "SELECT conversation_id, updated_at FROM raw_conversations WHERE source = 'chatgpt'"
+        ).fetchall())
+
+        stats = {"inserted": 0, "updated": 0, "unchanged": 0, "superseded": 0, "failed": 0, "retries": 0,
+                  "inserted_titles": [], "updated_titles": [], "stopped_early": False}
+        if args.notify:
+            ntfy_notify(
+                "ChatGPT import starting",
+                f"{len(filtered)} candidates to check"
+                + (f" -- capped at {max_runtime_minutes:.0f}m" if max_runtime_minutes else ""),
+                priority="low",
+                tags="rocket",
+            )
+        stopped_early = False
+        last_title = None
+        # Rolling window of the last few items' retry counts, feeding
+        # adaptive_pace() -- see its docstring for why a flat pace regardless of
+        # how throttled chatgpt.com clearly is was part of the problem.
+        recent_retry_counts = deque(maxlen=10)
         for i, conv in enumerate(filtered, 1):
+            if deadline is not None and time.monotonic() >= deadline:
+                stopped_early = True
+                stats["stopped_early"] = True
+                print(f"chatgpt: hit --max-runtime-minutes budget ({max_runtime_minutes}m) "
+                      f"with {len(filtered) - i + 1} left -- stopping here, rerun to resume "
+                      f"({progress_summary(i - 1, len(filtered), start_time, stats)})")
+                break
             if not gc.UUID_RE.match(conv["id"]):
                 continue
+            conv_updated = norm_ts(gc.parse_api_timestamp(conv["update_time"])) if conv.get("update_time") else None
+            if conv_updated is not None and existing_updated_at.get(conv["id"]) == conv_updated:
+                stats["unchanged"] += 1
+                last_title = conv.get("title") or last_title
+                print(f"[{i}/{len(filtered)}] unchanged, cached -- no fetch ({conv.get('title')!r})")
+                continue
             try:
+                retries_before = stats["retries"]
                 data = fetch_conversation_with_retry(
                     lambda: gconn.evaluate(gc.js_fetch_conversation(token, conv["id"])),
-                    source="chatgpt", label=conv["id"],
+                    source="chatgpt", label=conv["id"], stats=stats,
                 )
+                recent_retry_counts.append(stats["retries"] - retries_before)
                 created_at = norm_ts(gc.parse_api_timestamp(data.get("create_time")))
                 updated_at = norm_ts(gc.parse_api_timestamp(data.get("update_time")))
                 # The per-conversation detail fetch (data) returns title=null for
@@ -430,6 +543,7 @@ def run_chatgpt(conn, args):
                 # going forward), fall back to the list summary's rather than
                 # storing/reporting a needlessly wrong "(untitled)".
                 title = data.get("title") or conv.get("title")
+                last_title = title
                 outcome, superseded = upsert(
                     conn,
                     source="chatgpt",
@@ -447,30 +561,46 @@ def run_chatgpt(conn, args):
                 elif outcome == "updated":
                     stats["updated_titles"].append(title or "(untitled)")
                 print(f"[{i}/{len(filtered)}] {outcome} ({'superseded old row, ' if superseded else ''}{title!r})")
+                pace = adaptive_pace(recent_retry_counts)
                 if i % args.batch_size == 0:
                     conn.commit()
                     print(f"  -- committed batch through {i} --")
                     if args.notify:
                         ntfy_notify(
                             "ChatGPT import progress",
-                            f"{i}/{len(filtered)} processed -- "
-                            f"{stats['inserted']} new, {stats['updated']} updated, "
-                            f"{stats['superseded']} superseded, {stats['failed']} failed",
+                            f"{i}/{len(filtered)} checked ({progress_summary(i, len(filtered), start_time, stats)}, "
+                            f"pace {pace:.1f}s/item) -- "
+                            f"{stats['inserted']} new, {stats['updated']} updated, {stats['unchanged']} unchanged, "
+                            f"{stats['superseded']} superseded, {stats['failed']} failed -- "
+                            f"last: {title!r}",
                             priority="low",
                             tags="arrows_counterclockwise",
                         )
-                time.sleep(0.5)
+                time.sleep(pace)
             except Exception as e:  # noqa: BLE001
                 stats["failed"] += 1
+                # Count as a max-retries item too -- an outright failure after
+                # exhausting every attempt is at least as strong a throttling
+                # signal as a retry that eventually succeeded, and should slow
+                # the next fetch down the same way (see adaptive_pace).
+                recent_retry_counts.append(3)
                 print(f"[{i}/{len(filtered)}] FAILED {conv.get('id')}: {e}", file=sys.stderr)
+                time.sleep(adaptive_pace(recent_retry_counts))
         conn.commit()
-        print(f"chatgpt done: {stats}")
+        processed = (i - 1) if stopped_early else len(filtered)
+        status = "stopped early (time budget)" if stopped_early else "done"
+        print(f"chatgpt {status}: {stats}")
         if args.notify:
+            summary = progress_summary(processed, len(filtered), start_time, stats) if filtered else "nothing to do"
             ntfy_notify(
-                "ChatGPT import finished",
-                f"Done: {len(filtered)} processed -- {stats}",
+                f"ChatGPT import {'paused' if stopped_early else 'finished'}",
+                f"{'Stopped early, rerun to resume' if stopped_early else 'Done'}: "
+                f"{processed}/{len(filtered)} checked ({summary}) -- "
+                f"{stats['inserted']} new, {stats['updated']} updated, {stats['unchanged']} unchanged, "
+                f"{stats['superseded']} superseded, {stats['failed']} failed, {stats['retries']} retries -- "
+                f"last: {last_title!r}",
                 priority="default",
-                tags="white_check_mark",
+                tags="hourglass_flowing_sand" if stopped_early else "white_check_mark",
             )
         return stats
     finally:
@@ -510,6 +640,11 @@ def main():
     parser.add_argument("--db", default=str(DB_PATH))
     parser.add_argument("--limit", type=int, default=None, help="Max conversations to import this run")
     parser.add_argument("--batch-size", type=int, default=10, help="Commit every N conversations")
+    parser.add_argument("--max-runtime-minutes", type=float, default=None,
+                         help="Stop starting new conversation fetches after this many minutes "
+                              "(commits what's already done and exits cleanly -- rerun the same "
+                              "command to resume, upsert() skips anything already unchanged). "
+                              "Unlimited if unset.")
     parser.add_argument("--notify", action="store_true", help="Push an ntfy.sh update after every batch")
     parser.add_argument("--after", type=parse_date)
     parser.add_argument("--before", type=parse_date)
@@ -524,23 +659,43 @@ def main():
     # routinely contain characters it can't encode (Hebrew, emoji, etc.).
     # Replace rather than crash -- this only affects what's printed, never
     # what's written to the DB (raw_json/title always go in as true UTF-8).
-    sys.stdout.reconfigure(errors="replace")
-    sys.stderr.reconfigure(errors="replace")
+    #
+    # line_buffering=True too: Python fully block-buffers stdout (not
+    # line-buffers) whenever it's not a real console -- i.e. every time this
+    # is run with `> log.txt` or in the background, which is the normal way
+    # to run a multi-hour import. Real incident, 2026-08-06: a long chatgpt
+    # import looked "stopped" for ~10 minutes -- it wasn't; every per-item
+    # print() (including the "[i/N] outcome" lines) was sitting in an
+    # unflushed buffer while retries kept happening underneath (those go to
+    # stderr, which was already unbuffered, so only *they* showed up in the
+    # log -- misleadingly making it look like nothing but retries was
+    # happening). Forcing line buffering here makes the log file reflect
+    # reality in real time regardless of how stdout is redirected.
+    sys.stdout.reconfigure(errors="replace", line_buffering=True)
+    sys.stderr.reconfigure(errors="replace", line_buffering=True)
 
     lock_path = Path(str(args.db) + ".import-lock")
+    stopped_early = False
     with import_lock(lock_path):
         conn = sqlite3.connect(args.db)
         conn.executescript(SCHEMA)
         try:
             if args.source == "claude":
-                run_claude(conn, args)
+                stopped_early = run_claude(conn, args)["stopped_early"]
             elif args.source == "chatgpt":
-                run_chatgpt(conn, args)
+                stopped_early = run_chatgpt(conn, args)["stopped_early"]
             else:
                 changed, total = rehash_all_content_hashes(conn)
                 print(f"rehash done: {changed}/{total} rows had their content_hash recomputed")
         finally:
             conn.close()
+
+    # Exit code 3 specifically (not just "nonzero") so a supervisor loop
+    # (see resilient_import.py) can tell "ran out of --max-runtime-minutes,
+    # more to do -- relaunch" apart from an actual crash. 0 means either a
+    # normal full pass or a source with no time budget concept (rehash).
+    if stopped_early:
+        sys.exit(3)
 
 
 if __name__ == "__main__":
