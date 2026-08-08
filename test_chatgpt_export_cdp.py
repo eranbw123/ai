@@ -8,6 +8,7 @@ an item older than `after`, instead of walking every page.
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from chatgpt_export_cdp import fetch_all_conversation_summaries  # noqa: E402
@@ -55,9 +56,16 @@ class TestEarlyStopPagination(unittest.TestCase):
         self.assertEqual(len(result), 10)  # pages 0 and 1 combined
 
     def test_no_after_bound_walks_all_pages(self):
+        # The trailing empty page now gets retried (max_attempts=4) before being
+        # trusted as real end-of-data -- see fetch_all_conversation_summaries'
+        # docstring for why an unretried empty page at offset > 0 was itself the
+        # bug (2026-08-06 incident: it silently truncated a live pagination run
+        # to one page under real throttling). Patch time.sleep so those 3 retry
+        # backoffs (10/20/30s) don't actually burn ~60s of wall time here.
         conn = FakeConn()
-        result = fetch_all_conversation_summaries(conn, token="fake", after=None, limit=5)
-        self.assertEqual(conn.call_count, 4)  # 3 pages of data + 1 empty page to confirm end
+        with patch("chatgpt_export_cdp.time.sleep"):
+            result = fetch_all_conversation_summaries(conn, token="fake", after=None, limit=5)
+        self.assertEqual(conn.call_count, 7)  # 3 pages of data + 4 attempts at the trailing empty page
         self.assertEqual(len(result), 15)
 
 

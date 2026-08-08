@@ -107,14 +107,59 @@ def fetch_all_conversation_summaries(conn, token, after=None, limit=100, max_con
     and update_time >= create_time always holds for any item -- so once
     update_time drops below `after`, every remaining (older) item is too old
     on *both* fields, regardless of which one you're actually filtering by.
+
+    Every empty page gets retried (same 10/20/30s backoff shape as
+    fetch_conversation_with_retry in export_to_sqlite.py) before being
+    accepted as real end-of-data, not just the offset-0 page -- and offset 0
+    specifically raises instead of returning [] if it's still empty after
+    retrying. Real incident, 2026-08-06: with chatgpt.com already heavily
+    rate-limited from repeated same-day full-history passes (compounded, it
+    turned out, by poll_conversations.py's own background polling adding to
+    the same request volume the whole time), the very first page came back
+    `{"items": []}` -- indistinguishable, before this fix, from a real
+    zero-conversation account. run_chatgpt() (export_to_sqlite.py) took the
+    resulting empty `conversations` list at face value, logged "0 of 0
+    conversations to import", and exited with status 0 ("nothing to do"),
+    which fooled resilient_import.py's supervisor loop into declaring the
+    whole backlog complete and stopping, having imported nothing. Retrying
+    fixed offset 0 -- but the very next live run then truncated to exactly
+    one page (100 of ~1630 real conversations) because *page 2* came back
+    empty and, at the time, an empty page at offset > 0 was accepted
+    immediately as the legitimate end-of-data signal with no retry at all --
+    which is right when chatgpt.com is healthy (a page short of `limit`
+    items is still the reliable, unretried signal for that: see the
+    `len(items) < limit` check below), but wrong under the same throttling
+    that hit offset 0. Retrying before accepting *any* empty page costs
+    nothing extra in the healthy case (a real final page is almost always
+    short-but-non-empty, so pagination stops via the `len(items) < limit`
+    check one page earlier and never even requests the trailing empty one);
+    the only added cost is up to one ~60s retry cycle in the rarer case
+    where the true total happens to be an exact multiple of `limit`.
     """
     conversations = []
     offset = 0
+    max_attempts = 4
     while True:
-        page = conn.evaluate(js_fetch_conversations_page(token, offset, limit))
-        items = page.get("items") or []
+        items = []
+        for attempt in range(1, max_attempts + 1):
+            page = conn.evaluate(js_fetch_conversations_page(token, offset, limit))
+            items = page.get("items") or []
+            if items:
+                break
+            if attempt < max_attempts:
+                wait = 10 * attempt
+                print(f"  empty page at offset {offset} of chatgpt conversation list "
+                      f"(attempt {attempt}/{max_attempts}), retrying after {wait}s -- "
+                      f"likely rate-limited, not necessarily end of data", file=sys.stderr)
+                time.sleep(wait)
         if not items:
-            break
+            if offset == 0:
+                raise RuntimeError(
+                    f"chatgpt conversation list came back empty after {max_attempts} attempts at "
+                    "offset 0 -- treating as a fetch failure (rate limit / stale session), not "
+                    "truly zero conversations"
+                )
+            break  # retried and still empty at offset > 0 -- accept as genuine end-of-data
         conversations.extend(items)
         if after is not None:
             oldest_update = parse_api_timestamp(items[-1].get("update_time"))
