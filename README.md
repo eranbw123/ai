@@ -39,6 +39,20 @@ artifact (topic summary) for consumption by other repos.
   title, windowed by recency) from `conversations.db` and writes it out for
   other repos to consume, per the schema in `PERSONAL_STATE_CONTRACT.md`
   (current version: 1). Read-only — never writes to `conversations.db`.
+- **Knowledge state** (`knowledge_state.py`): a second, structurally
+  distinct per-topic artifact — familiarity (exposure × temporal spread ×
+  recency decay) rather than interest. Its formula constants are
+  pre-registered and frozen in `KNOWLEDGE_STATE_EXPERIMENT.md`;
+  `eval_knowledge_state.py` is the frozen replay-eval harness. Opt-in only:
+  `personal_state.py --with-knowledge-state` merges its additive fields into
+  the topic records, and the default contract-v1 output is unchanged.
+- **Weak labels** (`weak_labels.py`): read-only, stdlib-only extractor of
+  five weak behavioral labels per conversation (depth, sustained follow-up,
+  rapid abandonment, response rejection, recurrence), each record carrying
+  provenance, confidence, and degraded reasons. Output `weak_labels.json`
+  is local-only and gitignored — never-gold supervision data, not part of
+  the personal-state contract and consumed by no other module (guard-tested).
+  Definitions and thresholds: `WEAK_LABELS.md`.
 - `migrate_md_to_sqlite.py` is a one-off migration from an older
   markdown-export layout into SQLite; no longer needed for normal use.
 
@@ -85,4 +99,9 @@ check for `council_bot.py`, run by hand — it's not part of the offline suite.
 - `view_conversations_server.py` — read-only local web viewer.
 - `personal_state.py` / `PERSONAL_STATE_CONTRACT.md` — topic-state artifact
   and its versioned schema contract.
+- `knowledge_state.py` / `eval_knowledge_state.py` /
+  `KNOWLEDGE_STATE_EXPERIMENT.md` — familiarity artifact, its frozen replay
+  eval, and the pre-registered formula + results log.
+- `weak_labels.py` / `WEAK_LABELS.md` — weak behavioral labels extractor and
+  its label definitions/thresholds.
 - `migrate_md_to_sqlite.py` — legacy one-off markdown→SQLite migration.
