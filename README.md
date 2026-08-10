@@ -39,6 +39,31 @@ artifact (topic summary) for consumption by other repos.
   title, windowed by recency) from `conversations.db` and writes it out for
   other repos to consume, per the schema in `PERSONAL_STATE_CONTRACT.md`
   (current version: 1). Read-only — never writes to `conversations.db`.
+  Opt-in `--with-knowledge-state` merges `knowledge_state.py`'s additive
+  fields into the topic records by token key; the default (contract
+  version 1) output is unchanged.
+- **Knowledge state** (`knowledge_state.py`): a separate, not-yet-published
+  experiment that derives per-topic `familiarity` — exposure depth × temporal
+  spread × recency decay — as opposed to `personal_state.py`'s plain
+  frequency-based `weight`. Reuses `personal_state`'s tokenizer/writer rather
+  than duplicating them; same read-only, no-conversation-id privacy
+  invariant. `eval_knowledge_state.py` is a frozen, pre-registered replay-eval
+  harness that compares `familiarity` against frequency and recency
+  baselines on a train/test split of the real corpus; see
+  `KNOWLEDGE_STATE_EXPERIMENT.md` for the pre-registration and results (run
+  once so far — no real corpus was reachable in that environment, so the
+  recorded verdict is "inconclusive, no corpus available"; the harness
+  self-test suite passes). `familiarity` is descriptive-only and not used by
+  anything unless `personal_state.py` is run with `--with-knowledge-state`.
+- **Weak labels** (`weak_labels.py`): a read-only, deterministic, no-LLM
+  extractor of five weak per-conversation behavioral labels (`depth`,
+  `sustained_followup`, `rapid_abandonment`, `response_rejection`,
+  `recurrence`), each with a `confidence`, `degraded_reasons`, and
+  `provenance` record. Its output, `weak_labels.json`, is local-only
+  (gitignored), never treated as ground truth, and not consumed by
+  `personal_state.py`/`knowledge_state.py` or any other module (a dedicated
+  test guards against that). See `WEAK_LABELS.md` for label definitions,
+  thresholds, the recorded real-corpus distribution, and how to regenerate.
 - `migrate_md_to_sqlite.py` is a one-off migration from an older
   markdown-export layout into SQLite; no longer needed for normal use.
 
@@ -85,4 +110,9 @@ check for `council_bot.py`, run by hand — it's not part of the offline suite.
 - `view_conversations_server.py` — read-only local web viewer.
 - `personal_state.py` / `PERSONAL_STATE_CONTRACT.md` — topic-state artifact
   and its versioned schema contract.
+- `knowledge_state.py` / `eval_knowledge_state.py` /
+  `KNOWLEDGE_STATE_EXPERIMENT.md` — experimental familiarity artifact and its
+  frozen replay-eval harness/pre-registration.
+- `weak_labels.py` / `WEAK_LABELS.md` — read-only weak behavioral label
+  extractor and its label/threshold documentation.
 - `migrate_md_to_sqlite.py` — legacy one-off markdown→SQLite migration.
