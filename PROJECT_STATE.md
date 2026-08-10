@@ -51,19 +51,11 @@ python -c "import sqlite3;print(sqlite3.connect('file:conversations.db?mode=ro',
 ```
 
 ## Loop closure guard (step-08)
-Confirmed the existing `is_council_bot_scratch_conversation()` exclusion in
-`export_to_sqlite.py` is this repo's anti-leakage back-channel guard, and it
-was already covered by a test (`test_export_to_sqlite.py`,
-`TestCouncilBotScratchConversationFilter`) asserting the scratch row never
-reaches `raw_conversations`. Extended that test with one more case:
-`personal_state.derive()` output is byte-identical whether or not an
-excluded scratch conversation was present in the upstream batch, so the
-exclusion has zero downstream side effect on the artifact, not just a
-missing row. No production code changed; `personal_state.py`,
-`knowledge_state.py`, and both eval scripts have zero diffs;
-`CONTRACT_VERSION` stays `1`. Documented the one-directional data-flow
-invariant (conversations → artifact → consumers, never back) and the
-consumer-side provenance expectation (artifact sha256/`generated_at`/
-`contract_version` recorded by any seeding consumer) in
-`PERSONAL_STATE_CONTRACT.md`'s new "Loop closure and leakage (step-08)"
-section, and reaffirmed the step-05 no-scoring-input gate is unchanged.
+`export_to_sqlite.py`'s existing `is_council_bot_scratch_conversation()`
+exclusion is the anti-leakage back-channel guard; its test now also proves
+`personal_state.derive()` output is byte-identical with/without an excluded
+scratch row upstream (zero downstream side effect, not just a missing row).
+No production code changed; `CONTRACT_VERSION` stays `1`. See
+`PERSONAL_STATE_CONTRACT.md`'s "Loop closure and leakage (step-08)" section
+for the one-directional flow invariant, consumer provenance expectation, and
+the (unchanged) step-05 no-scoring-input gate.

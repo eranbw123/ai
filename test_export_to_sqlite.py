@@ -86,6 +86,14 @@ class TestCouncilBotScratchConversationFilter(unittest.TestCase):
 
         self.assertEqual(stats["inserted"], 1)
         self.assertEqual(stats["inserted_titles"], ["A real conversation"])
+        # FakeCDPConnection serves queued responses by call order, not by
+        # requested uuid, so a guard that skipped fetching by index rather
+        # than by identity could still pass the two assertions above (the
+        # real conversation's detail payload would satisfy whichever fetch
+        # runs first). stats["failed"] catches that: if the guard didn't
+        # actually skip the scratch conversation, the second fetch attempt
+        # would exhaust the single queued response and be counted as failed.
+        self.assertEqual(stats["failed"], 0)
         row = conn.execute(
             "SELECT COUNT(*) FROM raw_conversations WHERE conversation_id = ?", (scratch["uuid"],)
         ).fetchone()
@@ -121,7 +129,8 @@ class TestCouncilBotScratchConversationFilter(unittest.TestCase):
         with patch("export_to_sqlite.cc.require_org_id", return_value="6a700000-0000-4000-8000-000000000000"), \
              patch("export_to_sqlite.cc.connect", return_value=FakeCDPConnection(responses=[detail])), \
              patch("export_to_sqlite.cc.fetch_all_conversation_summaries", return_value=[scratch, real]):
-            ets.run_claude(conn_with_scratch, args)
+            stats_with = ets.run_claude(conn_with_scratch, args)
+        self.assertEqual(stats_with["failed"], 0, "guard must skip the scratch row, not fail to fetch it")
 
         conn_without_scratch = sqlite3.connect(":memory:")
         self.addCleanup(conn_without_scratch.close)
@@ -129,10 +138,24 @@ class TestCouncilBotScratchConversationFilter(unittest.TestCase):
         with patch("export_to_sqlite.cc.require_org_id", return_value="6a700000-0000-4000-8000-000000000000"), \
              patch("export_to_sqlite.cc.connect", return_value=FakeCDPConnection(responses=[detail])), \
              patch("export_to_sqlite.cc.fetch_all_conversation_summaries", return_value=[real]):
-            ets.run_claude(conn_without_scratch, args)
+            stats_without = ets.run_claude(conn_without_scratch, args)
+        self.assertEqual(stats_without["failed"], 0)
 
-        state_with_scratch = ps.derive(conn_with_scratch, min_conversations=1)
-        state_without_scratch = ps.derive(conn_without_scratch, min_conversations=1)
+        # window_days=0: the fixture's updated_at is a fixed 2026-01-01 timestamp,
+        # so the default window_days=180 cutoff would filter every row out as
+        # the real "now" recedes past it, silently making the byte comparison
+        # below vacuous (both sides collapsing to the same empty artifact
+        # regardless of whether the scratch row leaked). window_days=0 keeps
+        # this fixture hermetic and time-independent.
+        state_with_scratch = ps.derive(conn_with_scratch, window_days=0, min_conversations=1)
+        state_without_scratch = ps.derive(conn_without_scratch, window_days=0, min_conversations=1)
+
+        # Positive control: prove the comparison below actually has teeth --
+        # the "without scratch" artifact must contain real, non-empty content
+        # derived from the surviving conversation, not just two empty/equal
+        # artifacts.
+        self.assertEqual(state_without_scratch["conversation_count"], 1)
+        self.assertIn("apples", [t["key"] for t in state_without_scratch["topics"]])
 
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)

@@ -181,7 +181,8 @@ arrow.
 - Consumers that seed their own state from this artifact should record the
   artifact's identity in their own provenance, not just the values they
   read from it: sha256 of the artifact file's bytes, its `generated_at`,
-  and its `contract_version`. As of step-08, `internet`'s `interest_events`
+  and its `contract_version`. Per the `internet` repo's own step-08 task
+  (not independently verifiable from this repo), its `interest_events`
   does this for its `personal_state`-seeded rows.
 - The step-05 adoption gate remains in force, unchanged by this step: per
   `FUTURE_SELF_EXPERIMENT.md`'s INCONCLUSIVE-NO-CORPUS branch, neither
