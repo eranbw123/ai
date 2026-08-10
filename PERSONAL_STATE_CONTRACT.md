@@ -28,7 +28,7 @@ Each entry in `topics`:
 | `key`           | string | yes      | A lowercase token derived from conversation titles (see Derivation below). |
 | `weight`        | float  | yes      | `round(conversations / max_conversations, 4)`, in `[0, 1]`, where `max_conversations` is the highest `conversations` count among the artifact's topics. |
 | `conversations` | int    | yes      | Number of distinct conversations whose title contains this token. |
-| `last_seen`     | string | yes      | The max `updated_at` (ISO-8601) among conversations containing this token. |
+| `last_seen`     | string \| null | yes | The max `updated_at` (ISO-8601) among conversations containing this token, or `null` if none of those conversations have a parseable `updated_at` (e.g. rows with a NULL `updated_at`, such as `markdown_reconstructed` imports or Claude API responses that omitted it). Key is always present; consumers must handle a null value. |
 
 ## Derivation (informative — see `personal_state.py:derive()` for the
 normative implementation)

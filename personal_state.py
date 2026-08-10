@@ -46,13 +46,19 @@ STOPWORDS = {
     "code", "file", "script", "error", "project", "untitled",
 }
 
-_TOKEN_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+# Unicode-aware: \w (and its complement \W) already matches non-ASCII word
+# characters in Python 3 str patterns, so this splits correctly on titles
+# containing Hebrew, Cyrillic, accented Latin, etc. -- not just ASCII.
+# Underscore is added explicitly because \w treats it as a word char, but
+# "split on non-alphanumeric" (the spec) means underscore is a separator too.
+_TOKEN_SPLIT_RE = re.compile(r"[\W_]+")
 
 
 def _tokenize(title):
-    """Lowercase + split on non-alphanumeric, then drop short/long/numeric/
-    stopword tokens. Returns a set (each token counts once per conversation,
-    regardless of how many times it appears in that title)."""
+    """Lowercase + split on non-alphanumeric (Unicode-aware), then drop
+    short/long/numeric/stopword tokens. Returns a set (each token counts
+    once per conversation, regardless of how many times it appears in that
+    title)."""
     if not title:
         return set()
     tokens = set()
@@ -148,6 +154,11 @@ def derive(conn, *, window_days=180, max_topics=50, min_conversations=2):
     topics = []
     for token, count in kept[:max_topics]:
         _, last_seen = token_last_seen[token]
+        # last_seen may be null: updated_at is a nullable column in practice
+        # (Claude API omitting it, markdown_reconstructed rows with no
+        # header) and with window_days=0 such rows aren't filtered out. The
+        # contract declares last_seen nullable for exactly this reason --
+        # see PERSONAL_STATE_CONTRACT.md.
         topics.append({
             "key": token,
             "weight": round(count / max_count, 4) if max_count else 0.0,
