@@ -204,6 +204,13 @@ def main():
     parser.add_argument("--window-days", type=int, default=180)
     parser.add_argument("--max-topics", type=int, default=50)
     parser.add_argument("--min-conversations", type=int, default=2)
+    parser.add_argument(
+        "--with-knowledge-state", action="store_true", default=False,
+        help="Merge knowledge_state.py's additive fields (first_seen, "
+             "span_days, recency_days, active_months, familiarity) into "
+             "each topic record. Default off; with it off, output is "
+             "byte-identical to before this flag existed.",
+    )
     args = parser.parse_args()
 
     conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
@@ -214,6 +221,24 @@ def main():
             max_topics=args.max_topics,
             min_conversations=args.min_conversations,
         )
+        if args.with_knowledge_state:
+            import knowledge_state as ks
+
+            ks_topics = ks.derive(
+                conn,
+                now=datetime.now(timezone.utc),
+                window_days=args.window_days,
+                max_topics=10 ** 9,  # candidate set must not be truncated to merge cleanly
+                min_conversations=args.min_conversations,
+            )
+            ks_by_key = {t["key"]: t for t in ks_topics}
+            for topic in state["topics"]:
+                extra = ks_by_key.get(topic["key"])
+                if not extra:
+                    continue
+                for field in ("first_seen", "span_days", "recency_days",
+                              "active_months", "familiarity"):
+                    topic[field] = extra[field]
     finally:
         conn.close()
 
