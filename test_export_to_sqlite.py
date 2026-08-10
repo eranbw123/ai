@@ -4,6 +4,7 @@ credentials -- run_claude()/run_chatgpt() are exercised against a fake CDP
 connection and a throwaway in-memory db).
 """
 import json
+import shutil
 import sys
 import sqlite3
 import tempfile
@@ -15,6 +16,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import export_to_sqlite as ets  # noqa: E402
+import personal_state as ps  # noqa: E402 -- only used by the leakage-into-derivation check below
 
 
 # A minimal but non-empty ChatGPT `mapping` -- real conversations always have
@@ -88,6 +90,60 @@ class TestCouncilBotScratchConversationFilter(unittest.TestCase):
             "SELECT COUNT(*) FROM raw_conversations WHERE conversation_id = ?", (scratch["uuid"],)
         ).fetchone()
         self.assertEqual(row[0], 0, "the scratch conversation must never be imported")
+
+    @patch("personal_state._now_iso", return_value="2026-01-01T00:00:00Z")
+    def test_excluded_scratch_conversation_never_perturbs_derive_output(self, _mock_now):
+        """The scratch skip in run_claude() is step-08's anti-leakage back
+        channel guard: council_bot's own output must never re-enter the
+        corpus that personal_state.derive() aggregates over. It's not enough
+        to prove the scratch row never lands in raw_conversations (the test
+        above) -- prove the artifact derived from the surviving rows is
+        exactly the same whether or not the scratch conversation was ever
+        present in the upstream batch, i.e. exclusion is silent and has zero
+        side effect on the next stage."""
+        scratch = {"uuid": "6a700000-0000-4000-8000-0000000000ee", "name": "Council: another test question",
+                   "created_at": "2026-01-01T00:00:00.000000Z", "updated_at": "2026-01-01T00:00:00.000000Z"}
+        real = {"uuid": "6a700000-0000-4000-8000-0000000000ff", "name": "A real conversation about apples",
+                "created_at": "2026-01-01T00:00:00.000000Z", "updated_at": "2026-01-01T00:00:00.000000Z"}
+        detail = {"uuid": real["uuid"], "name": real["name"], "created_at": real["created_at"],
+                   "updated_at": real["updated_at"], "current_leaf_message_uuid": None,
+                   "chat_messages": [{"uuid": "m1", "sender": "human", "text": "hi"}]}
+        args = types.SimpleNamespace(port=9222, limit=None, batch_size=10, notify=False, after=None, before=None)
+
+        # Batch A: scratch conversation present upstream (and excluded by
+        # run_claude()). Batch B: scratch conversation never existed
+        # upstream at all. Only one CDP response queued in either case --
+        # if the scratch conversation were ever fetched, both runs would
+        # raise IndexError.
+        conn_with_scratch = sqlite3.connect(":memory:")
+        self.addCleanup(conn_with_scratch.close)
+        conn_with_scratch.executescript(ets.SCHEMA)
+        with patch("export_to_sqlite.cc.require_org_id", return_value="6a700000-0000-4000-8000-000000000000"), \
+             patch("export_to_sqlite.cc.connect", return_value=FakeCDPConnection(responses=[detail])), \
+             patch("export_to_sqlite.cc.fetch_all_conversation_summaries", return_value=[scratch, real]):
+            ets.run_claude(conn_with_scratch, args)
+
+        conn_without_scratch = sqlite3.connect(":memory:")
+        self.addCleanup(conn_without_scratch.close)
+        conn_without_scratch.executescript(ets.SCHEMA)
+        with patch("export_to_sqlite.cc.require_org_id", return_value="6a700000-0000-4000-8000-000000000000"), \
+             patch("export_to_sqlite.cc.connect", return_value=FakeCDPConnection(responses=[detail])), \
+             patch("export_to_sqlite.cc.fetch_all_conversation_summaries", return_value=[real]):
+            ets.run_claude(conn_without_scratch, args)
+
+        state_with_scratch = ps.derive(conn_with_scratch, min_conversations=1)
+        state_without_scratch = ps.derive(conn_without_scratch, min_conversations=1)
+
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        out_with, out_without = tmp / "with_scratch.json", tmp / "without_scratch.json"
+        ps.write(out_with, state_with_scratch)
+        ps.write(out_without, state_without_scratch)
+        self.assertEqual(
+            out_with.read_bytes(), out_without.read_bytes(),
+            "personal_state.derive() output must be byte-identical whether or not an "
+            "excluded council_bot scratch conversation was present in the input stream",
+        )
 
 
 class TestRunChatgptTitleFallback(unittest.TestCase):

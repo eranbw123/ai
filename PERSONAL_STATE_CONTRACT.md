@@ -156,3 +156,38 @@ These fields therefore have **no measured predictive validity yet** and
 MUST NOT be used as a novelty-scoring input pending a real evaluation run;
 they are descriptive/opt-in only. See `KNOWLEDGE_STATE_EXPERIMENT.md` for
 the full record and the command to produce a real result later.
+
+## Loop closure and leakage (step-08)
+
+The artifact flows **one direction only**: `conversations.db` →
+`personal_state.json` → consumers. Nothing a consumer produces or does with
+the artifact is ever allowed to flow back into the input side of that
+arrow.
+
+- No consumer output — discovery items, digests, council/bot replies, or
+  any other derived text — may be written into `raw_conversations`, and
+  none may be fed back into `personal_state.py`'s or `knowledge_state.py`'s
+  derivation. Derivation reads only real owner conversations.
+- The existing `is_council_bot_scratch_conversation()` exclusion in
+  `export_to_sqlite.py` (see its docstring) is this repo's concrete
+  instance of that guard for `council_bot.py`'s own scratch conversations:
+  they never reach `raw_conversations`, so they can never contribute a
+  token to a future artifact. Covered by
+  `test_export_to_sqlite.py::TestCouncilBotScratchConversationFilter`,
+  including a case asserting `personal_state.derive()` output is
+  byte-identical whether or not an excluded scratch conversation was ever
+  present in the upstream batch — exclusion has zero downstream side
+  effect, not just "the row is missing."
+- Consumers that seed their own state from this artifact should record the
+  artifact's identity in their own provenance, not just the values they
+  read from it: sha256 of the artifact file's bytes, its `generated_at`,
+  and its `contract_version`. As of step-08, `internet`'s `interest_events`
+  does this for its `personal_state`-seeded rows.
+- The step-05 adoption gate remains in force, unchanged by this step: per
+  `FUTURE_SELF_EXPERIMENT.md`'s INCONCLUSIVE-NO-CORPUS branch, neither
+  `weight` (interest) nor `familiarity` (knowledge-state) may be used as a
+  scoring input anywhere until a real-corpus replay eval has actually run.
+  This section adds documentation and test coverage only — it does not
+  change `CONTRACT_VERSION` (still `1`), and `personal_state.py`,
+  `knowledge_state.py`, `eval_knowledge_state.py`, and `eval_future_self.py`
+  are unmodified by step-08.
