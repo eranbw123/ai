@@ -131,3 +131,111 @@ divergently)
 5. Compute hit@10 for INTEREST and RECENCY over TEST conversations; compute
    `p_perm` and effect size as defined above.
 6. Apply the decision rule mechanically and emit the JSON report.
+
+## Results (2026-08-10)
+
+**Corpus search (per pre-registered posture, in order):**
+1. `conversations.db` in this clone's repo root — **not present** (it is
+   gitignored derived data; this automation worktree clone does not carry
+   it).
+2. `AI_CONVERSATIONS_DB` environment variable — **not set** in this
+   session's environment.
+
+No real corpus was reachable from this worktree. Command run (exactly
+once, per the stopping condition):
+
+```
+python eval_future_self.py --db conversations.db --out future_self_eval.json
+```
+
+Output (`future_self_eval.json`, gitignored):
+
+```json
+{
+  "checked_paths": ["conversations.db"],
+  "cutoff": null,
+  "effect_size": null,
+  "interest_hit_at_10": null,
+  "mean_permuted_hit_at_10": null,
+  "n_candidates": null,
+  "n_dropped_rows": null,
+  "n_resamples": 2000,
+  "n_test": null,
+  "n_train": null,
+  "p_perm": null,
+  "recency_hit_at_10": null,
+  "seed": 1234,
+  "verdict": "INCONCLUSIVE — NO CORPUS AVAILABLE"
+}
+```
+
+**VERDICT: INCONCLUSIVE — NO CORPUS AVAILABLE.**
+
+This is not one of the three outcomes the decision rule adjudicates
+(SUPPORTED / FALSIFIED / INCONCLUSIVE-by-n); it is a precondition failure —
+the evaluation could not be executed at all in this environment. It is
+recorded honestly rather than manufactured, matching
+`KNOWLEDGE_STATE_EXPERIMENT.md`'s prior corpus-search outcome in this same
+clone.
+
+### Harness validation only, not evidence about the owner
+
+To confirm the harness itself is sound and ready to run against a real
+corpus, its offline test suite was executed:
+
+```
+python -m unittest test_eval_future_self -v
+```
+
+Result: all 10 tests pass, including the planted-signal and
+shuffled-labels self-tests. Actual figures observed (harness sanity only —
+both corpora below are synthetic and constructed so the outcome is
+predictable/unpredictable by design; these numbers say nothing about the
+real owner's data):
+
+- **Planted-signal corpus** (10 keeper tokens with 5 TRAIN conversations
+  each, spread across the window and each recurring in TEST by
+  construction, vs. 25 noise tokens with 2 TRAIN conversations each that
+  never recur): n_train=100, n_test=43, n_candidates=35,
+  `interest_hit@10 = 1.0000`, `recency_hit@10 = 0.0000` (the noise tokens
+  happen to be more recent than the keepers in this synthetic layout, so
+  B1 picks zero-signal tokens by construction), `mean_permuted_hit@10 =
+  0.2835`, `p_perm = 0.0005`, `effect_size = 0.7165` → **SUPPORTED**.
+- **Shuffled/unrelated-titles corpus** (same conversation counts and
+  shape, titles reassigned from a random word pool so pre-T topic
+  identity carries no relationship to post-T topics): n_train=77,
+  n_test=33, n_candidates=43, `interest_hit@10 = 0.2727`,
+  `recency_hit@10 = 0.1515`, `mean_permuted_hit@10 = 0.2248`,
+  `p_perm = 0.2989`, `effect_size = 0.0479` → **FALSIFIED** (p_perm did
+  not clear 0.05).
+
+These confirm the split/frozen-state/candidate-pool/permutation/decision
+machinery behaves correctly on data where the ground-truth relationship is
+known by construction. They are **not** a measurement of whether frozen
+personal-state topics predict the owner's real future conversations — that
+requires a real corpus, and per the pre-registration's stopping condition,
+running the harness now on a substitute would not count as (and must not
+be reported as) the pre-registered result.
+
+### Implication mapping now in force
+
+Per the pre-registered IMPLICATION MAPPING above: **INCONCLUSIVE — NO
+CORPUS AVAILABLE** is in force. Later steps must assume NEITHER interest
+nor knowledge-state has predictive validation; both this eval and
+`eval_knowledge_state.py` stay queued for the first session with a real
+`conversations.db`; no consumer (including `internet`'s
+`personal_state_top_terms` augmentation) may adopt either signal as a
+scoring input until then.
+
+### How to produce the real result later
+
+Run once, on a real `conversations.db`, and append a fresh dated `##
+Results` section (do not edit this one):
+
+```
+python eval_future_self.py --db conversations.db --out future_self_eval.json
+```
+
+(or point `--db` at the path held in `AI_CONVERSATIONS_DB` / wherever the
+owner's real export lives). Per the pre-registration, run it exactly once
+and record whatever verdict falls out mechanically.
