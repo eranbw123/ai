@@ -112,3 +112,47 @@ cat tmp_verify.json
 
 You should see a `topics` entry for `sqlite` and `export` (each appears in
 both titles), with `conversations: 2` and `weight: 1.0`.
+
+## Knowledge-state fields (additive, optional, v1)
+
+These fields are produced by `knowledge_state.py` and are **not** part of
+the default `personal_state.py` output. They are merged into each topic
+record only when `personal_state.py` is run with `--with-knowledge-state`
+(default off); with the flag off, output is byte-identical to the schema
+above. Per "Forward compatibility" above, these are optional additive
+per-topic fields, so `CONTRACT_VERSION` stays `1` and `internet`'s
+`SUPPORTED_VERSIONS` requires no change.
+
+| Field           | Type            | Nullable | Meaning |
+|-----------------|-----------------|----------|---------|
+| `first_seen`    | string          | yes      | Min `updated_at` (ISO-8601) among conversations containing this token, or `null` if none of those conversations have a parseable `updated_at`. |
+| `last_seen`     | string          | yes      | Max `updated_at` (ISO-8601) among conversations containing this token, or `null` under the same condition (same nullability rule as v1's `last_seen`). |
+| `span_days`     | int             | no       | Whole days between `first_seen` and `last_seen`; `0` if either is `null`. |
+| `recency_days`  | int             | yes      | Whole days from `last_seen` to `now`; `null` if `last_seen` is `null`. |
+| `active_months` | int             | no       | Count of distinct `(year, month)` pairs in which the token appeared. |
+| `familiarity`   | float           | no       | `[0, 1]`, the frozen formula below. |
+
+**Frozen familiarity formula** (pre-registered in
+`KNOWLEDGE_STATE_EXPERIMENT.md`; not to be tuned post-hoc; see
+`knowledge_state.py` for the normative implementation):
+
+```
+exposure = min(1.0, log(1 + conversations) / log(1 + SATURATION))     # SATURATION = 8
+spread   = min(1.0, active_months / SPREAD_MONTHS)                    # SPREAD_MONTHS = 6
+decay    = 0.5 ** (recency_days / HALF_LIFE_DAYS)  if recency_days is not None else 0.0   # HALF_LIFE_DAYS = 120
+familiarity = round((0.5 * exposure + 0.5 * spread) * decay, 4)
+```
+
+Conceptually: interest (`weight`, above) measures how OFTEN a topic comes
+up; `familiarity` measures accumulated exposure SPREAD OVER TIME and
+decayed by how long ago it was last touched. Two topics with identical
+`conversations` counts get different `familiarity` if one was a single-day
+burst and the other recurred across months.
+
+**Status:** INCONCLUSIVE -- NO CORPUS AVAILABLE on replay 2026-08-10 -- the
+pre-registered replay evaluation could not be run (no `conversations.db`
+reachable from the automation clone; see `KNOWLEDGE_STATE_EXPERIMENT.md`).
+These fields therefore have **no measured predictive validity yet** and
+MUST NOT be used as a novelty-scoring input pending a real evaluation run;
+they are descriptive/opt-in only. See `KNOWLEDGE_STATE_EXPERIMENT.md` for
+the full record and the command to produce a real result later.
