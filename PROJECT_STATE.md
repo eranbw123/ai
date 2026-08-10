@@ -6,6 +6,7 @@ token-efficiency rules. Current state only — not a log, not an architecture do
 ## Implemented
 Claude + ChatGPT export via CDP → SQLite; continuous poller; Telegram council bot; read-only web viewer (ngrok-exposed); one-off markdown→SQLite migration (done, no longer needed); resilient chunked-import supervisor; privacy-safe `personal_state.py` (interest = normalized frequency, v1 contract); `knowledge_state.py` (familiarity = exposure × temporal spread × recency decay, structurally distinct from interest) plus `eval_knowledge_state.py`, a frozen replay-eval harness comparing the two.
 
+`weak_labels.py` — read-only, stdlib-only extractor of 5 weak behavioral labels (depth, sustained_followup, rapid_abandonment, response_rejection, recurrence) per conversation, with provenance/confidence/degraded_reasons on every record. `weak_labels.json` is **local-only, gitignored, never-gold supervision data** — not part of the personal-state contract, not consumed by any other module (guard-tested). See `WEAK_LABELS.md` for label definitions, thresholds, and the recorded corpus distribution.
 ## Non-obvious decisions
 - No intermediate markdown/json export files any more — CDP goes straight to `raw_conversations`. Old markdown-derived rows are marked `markdown_reconstructed` and superseded when the real API row arrives.
 - `--after/--before` filter on `updated_at`, not `created_at`, so edited old conversations get re-imported.
@@ -20,6 +21,7 @@ Claude + ChatGPT export via CDP → SQLite; continuous poller; Telegram council 
 
 Personal-state contract (schema + version-bump procedure): `PERSONAL_STATE_CONTRACT.md`, currently v1. Knowledge-state pre-registration + (once run) results: `KNOWLEDGE_STATE_EXPERIMENT.md`.
 
+Weak-label definitions/thresholds/record schema/regenerate command: `WEAK_LABELS.md`.
 ## Adding a CLI flag (recurring task — no file reads needed)
 Each script builds its own `argparse.ArgumentParser` inside `main()`. Flags that
 `poll_conversations.py` must forward are read off `args` with
