@@ -13,7 +13,9 @@ Claude + ChatGPT export via CDP → SQLite; continuous poller; Telegram council 
 - Long-lived background runs on this machine get reaped silently (no traceback) — hence `resilient_import.py` + `--max-runtime-minutes`. Don't replace it with one long run.
 
 ## Key files
-`cdp.py` CDP client · `export_to_sqlite.py` fetch + `upsert()` (only DB writer) · `poll_conversations.py` poller · `resilient_import.py` supervisor · `council_bot.py` + `e2e_verify_bot.py` · `view_conversations_server.py` · `common.py` env/date/filename helpers.
+`cdp.py` CDP client · `export_to_sqlite.py` fetch + `upsert()` (only DB writer) · `poll_conversations.py` poller · `resilient_import.py` supervisor · `council_bot.py` + `e2e_verify_bot.py` · `view_conversations_server.py` · `common.py` env/date/filename helpers · `personal_state.py` derives the versioned, privacy-safe topic-state artifact for other repos.
+
+Personal-state contract (schema + version-bump procedure): `PERSONAL_STATE_CONTRACT.md`, currently v1.
 
 ## Adding a CLI flag (recurring task — no file reads needed)
 Each script builds its own `argparse.ArgumentParser` inside `main()`. Flags that

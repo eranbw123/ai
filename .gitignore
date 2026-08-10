@@ -16,3 +16,4 @@ poll_conversations.err.log
 *.log.pre-move
 *.err.log
 *.err.log.pre-move
+personal_state.json
