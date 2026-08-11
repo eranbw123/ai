@@ -55,6 +55,19 @@ artifact (topic summary) for consumption by other repos.
   recorded verdict is "inconclusive, no corpus available"; the harness
   self-test suite passes). `familiarity` is descriptive-only and not used by
   anything unless `personal_state.py` is run with `--with-knowledge-state`.
+- **Future-self experiment** (`eval_future_self.py`): a second, separate
+  frozen replay-eval harness, this one at the ARTIFACT level rather than the
+  token level — does the frozen `personal_state.py` top-10 topic set at a
+  historical time T predict the titles of conversations that happen after
+  T (hit@10 rate vs. a permutation-chance baseline and a recency-ranking
+  baseline)? Reuses `eval_knowledge_state.py`'s train/test split and
+  `personal_state.py`'s tokenizer/`derive()` rather than duplicating them.
+  See `FUTURE_SELF_EXPERIMENT.md` for the pre-registration and results (run
+  once so far — no real corpus was reachable in that environment, so the
+  recorded verdict is "inconclusive, no corpus available"; the harness
+  self-test suite passes). Per its pre-registered implication mapping, until
+  a real-corpus run happens, no consumer may adopt either `personal_state.py`
+  interest or `knowledge_state.py` familiarity topics as a scoring input.
 - **Weak labels** (`weak_labels.py`): a read-only, deterministic, no-LLM
   extractor of five weak per-conversation behavioral labels (`depth`,
   `sustained_followup`, `rapid_abandonment`, `response_rejection`,
@@ -113,6 +126,9 @@ check for `council_bot.py`, run by hand — it's not part of the offline suite.
 - `knowledge_state.py` / `eval_knowledge_state.py` /
   `KNOWLEDGE_STATE_EXPERIMENT.md` — experimental familiarity artifact and its
   frozen replay-eval harness/pre-registration.
+- `eval_future_self.py` / `FUTURE_SELF_EXPERIMENT.md` — frozen artifact-level
+  replay-eval harness (does frozen personal-state top-10 predict future
+  conversation titles?) and its pre-registration/results.
 - `weak_labels.py` / `WEAK_LABELS.md` — read-only weak behavioral label
   extractor and its label/threshold documentation.
 - `migrate_md_to_sqlite.py` — legacy one-off markdown→SQLite migration.
