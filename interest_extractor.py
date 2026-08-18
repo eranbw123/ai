@@ -1185,7 +1185,8 @@ def cmd_reduce(args):
         raise SystemExit(f"reduce: claude.ai is not reachable -- {why}")
     try:
         run_reduce(conn, dconn, llm, interests_path=args.interests, out_path=args.out,
-                   max_candidates=args.max_candidates, timeout=args.timeout)
+                   max_candidates=args.max_candidates, max_themes=args.max_themes,
+                   timeout=args.timeout)
     finally:
         llm.close()
         conn.close()
@@ -1216,6 +1217,25 @@ def build_parser():
     p_red.add_argument("--out", default=DEFAULT_OUT)
     p_red.add_argument("--interests", default=_default_interests_path())
     p_red.add_argument("--max-candidates", type=int, default=30)
+    # `run_reduce` has always taken max_themes; only the CLI could not reach it,
+    # so an unattended caller had no way to bound the request. It needs one.
+    #
+    # The theme list is effectively unbounded in practice. `passes_durability_gate`
+    # filters nothing on the real corpus -- map writes deliberately specific
+    # labels, so 837 of 838 themes hold exactly ONE conversation and every one
+    # of them is "transient" -- which means `gated or themes` in run_reduce
+    # always falls back to the whole list, and that list grows with the corpus.
+    # Measured 2026-08-18: 435 themes reduced fine, 400 and 838 both came back
+    # as "empty completion from claude.ai" within ten seconds, while 60 themes
+    # succeeded in 6 minutes. A nightly scheduled reduce therefore fails every
+    # night once the corpus is large enough, which is a harsher way of deciding
+    # which interests may exist than any cap is.
+    #
+    # The default is unchanged (DEFAULT_MAX_THEMES), so hand runs behave exactly
+    # as before; only a caller that asks for a bound gets one.
+    p_red.add_argument("--max-themes", type=int, default=DEFAULT_MAX_THEMES,
+                       help="cap the themes sent to the model (default %(default)s; "
+                            "lower it if reduce returns an empty completion)")
     p_red.add_argument("--timeout", type=int, default=900)
     p_red.set_defaults(func=cmd_reduce)
 
