@@ -591,6 +591,9 @@ def pending_entries(manifest, stored, *, sources=None, since=None):
 
 # ---------------------------------------------------------------- the slow run
 
+FETCH_TIMEOUT_SECONDS = 90
+
+
 class SourceClient:
     """One authenticated tab per source, able to rebuild itself after a drop."""
 
@@ -628,7 +631,14 @@ class SourceClient:
             js = gc.js_fetch_conversation(self.token, conversation_id)
         else:
             js = cc.js_fetch_conversation(self.org_id, conversation_id)
-        return self.conn.evaluate(js)
+        # An explicit, shorter timeout than cdp.evaluate's 120s default. A
+        # single conversation is a small request, so anything approaching a
+        # minute means the page's fetch is wedged rather than slow -- observed
+        # live 2026-08-18, when a pass went silent for over six minutes
+        # immediately after a 429 and had to be killed by hand. Surfacing it as
+        # a timeout turns it into is_connection_lost(), which reopens our tab
+        # and retries the item, instead of stalling the whole run.
+        return self.conn.evaluate(js, timeout=FETCH_TIMEOUT_SECONDS)
 
 
 def _row_from(source, entry, data):

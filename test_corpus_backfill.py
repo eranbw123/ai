@@ -390,6 +390,36 @@ class TestSameInstant(unittest.TestCase):
         self.assertEqual(cb.pending_entries(manifest, stored), [])
 
 
+class TestSourceClientFetchTimeout(unittest.TestCase):
+    """A single conversation is a small request, so a fetch that approaches a
+    minute means the page is wedged, not slow. Without an explicit timeout a
+    wedged fetch stalls the entire run (observed live, a pass went silent for
+    six minutes after a 429); with one it surfaces as a connection loss, which
+    the run loop already handles by reopening the tab and retrying."""
+
+    class RecordingConn:
+        def __init__(self):
+            self.kwargs = None
+
+        def evaluate(self, _js, **kwargs):
+            self.kwargs = kwargs
+            return {"mapping": dict(FAKE_MAPPING)}
+
+    def test_fetch_passes_an_explicit_timeout(self):
+        client = cb.SourceClient.__new__(cb.SourceClient)
+        client.source = "chatgpt"
+        client.token = "tok"
+        client.conn = self.RecordingConn()
+        client.fetch("6a7db96a-3478-83eb-8fcd-98cb355fe1bc")
+        self.assertEqual(client.conn.kwargs.get("timeout"), cb.FETCH_TIMEOUT_SECONDS)
+
+    def test_timeout_is_shorter_than_the_cdp_default(self):
+        self.assertLess(cb.FETCH_TIMEOUT_SECONDS, 120)
+
+    def test_a_timeout_counts_as_a_lost_connection(self):
+        self.assertTrue(cb.is_connection_lost(TimeoutError("timed out")))
+
+
 class TestPurgeAgentScratch(unittest.TestCase):
     """The queue-time guard stops new ones; a run predating it already wrote
     an 'interest-extractor scratch' row that had to come back out."""
