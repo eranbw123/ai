@@ -292,6 +292,65 @@ class TestUpdatedAtFiltering(unittest.TestCase):
         self.assertEqual(stats["updated_titles"], ["Old title"])
 
 
+class TestChatgptSkipCacheActuallySkips(unittest.TestCase):
+    """chatgpt.com's list and detail endpoints stamp update_time 1-2s apart.
+    run_chatgpt() decides whether to fetch by comparing the stored updated_at
+    against the *list* value, so storing the *detail* value made the two
+    permanently disagree and the "unchanged, cached -- no fetch" branch could
+    never fire -- every full pass re-requested nearly the whole history, which
+    is what escalated the 2026-08-05/06 throttling."""
+
+    def _import_once(self, conn, list_update, detail_update=None):
+        """One run_chatgpt() pass. With detail_update=None no detail response is
+        queued at all, so any attempt to fetch blows up instead of quietly
+        succeeding -- that is what makes "it skipped" distinguishable from "it
+        fetched and the content happened to be unchanged"."""
+        summary = {"id": "6a7db96a-3478-83eb-8fcd-98cb355fe1bc", "title": "A conversation",
+                   "create_time": "2026-08-17T00:00:00Z", "update_time": list_update}
+        responses = ["fake-token"]
+        if detail_update is not None:
+            responses.append({"conversation_id": "6a7db96a-3478-83eb-8fcd-98cb355fe1bc",
+                              "title": "A conversation",
+                              "create_time": "2026-08-17T00:00:00Z",
+                              "update_time": detail_update,
+                              "mapping": dict(FAKE_MAPPING)})
+        fake_conn = FakeCDPConnection(responses=responses)
+        args = types.SimpleNamespace(port=9222, limit=None, batch_size=10, notify=False,
+                                     after=None, before=None)
+        with patch("export_to_sqlite.gc.connect", return_value=fake_conn),              patch("export_to_sqlite.gc.fetch_all_conversation_summaries",
+                   return_value=[summary]),              patch("export_to_sqlite.time.sleep"):
+            return ets.run_chatgpt(conn, args)
+
+    def test_second_pass_skips_without_fetching(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(ets.SCHEMA)
+            first = self._import_once(conn, "2026-08-17T10:00:00Z", "2026-08-17T10:00:02Z")
+            self.assertEqual(first["inserted"], 1)
+            # Second pass: same list value, and no detail queued -- if the
+            # skip-cache does not fire, the fetch raises and shows up as failed.
+            second = self._import_once(conn, "2026-08-17T10:00:00Z")
+            self.assertEqual(second["unchanged"], 1)
+            self.assertEqual(second["inserted"] + second["updated"] + second["failed"], 0)
+        finally:
+            conn.close()
+
+    def test_a_real_update_is_still_refetched(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(ets.SCHEMA)
+            self._import_once(conn, "2026-08-17T10:00:00Z", "2026-08-17T10:00:02Z")
+            second = self._import_once(conn, "2026-08-18T09:00:00Z", "2026-08-18T09:00:02Z")
+            self.assertEqual(second["unchanged"] + second["updated"], 1)
+            self.assertEqual(second["failed"], 0)
+            stored = conn.execute(
+                "SELECT updated_at FROM raw_conversations").fetchone()[0]
+            self.assertTrue(stored.startswith("2026-08-18T09:00:00"),
+                            f"watermark must track the list value, got {stored!r}")
+        finally:
+            conn.close()
+
+
 class TestContentHashStability(unittest.TestCase):
     """Regression coverage for a real bug caught live: ChatGPT returns some
     bookkeeping list fields (e.g. safe_urls) in a different element order on
@@ -446,7 +505,7 @@ class TestEmptyPayloadProtection(unittest.TestCase):
         responses = iter([{}, {}, {"mapping": FAKE_MAPPING}])
         with patch("export_to_sqlite.time.sleep") as mock_sleep:
             data = ets.fetch_conversation_with_retry(
-                lambda: next(responses), source="chatgpt", label="conv-1",
+                lambda: next(responses), source="chatgpt", label="6a7db96a-3478-83eb-8fcd-98cb355fe1bc",
             )
         self.assertEqual(data, {"mapping": FAKE_MAPPING})
         self.assertEqual(mock_sleep.call_count, 2)  # backoff before attempts 2 and 3, none after success
@@ -455,14 +514,14 @@ class TestEmptyPayloadProtection(unittest.TestCase):
         with patch("export_to_sqlite.time.sleep"):
             with self.assertRaises(RuntimeError):
                 ets.fetch_conversation_with_retry(
-                    lambda: {}, source="chatgpt", label="conv-1", max_attempts=4,
+                    lambda: {}, source="chatgpt", label="6a7db96a-3478-83eb-8fcd-98cb355fe1bc", max_attempts=4,
                 )
 
     def test_fetch_with_retry_uses_linear_backoff(self):
         with patch("export_to_sqlite.time.sleep") as mock_sleep:
             with self.assertRaises(RuntimeError):
                 ets.fetch_conversation_with_retry(
-                    lambda: {}, source="chatgpt", label="conv-1", max_attempts=4, backoff_base=10,
+                    lambda: {}, source="chatgpt", label="6a7db96a-3478-83eb-8fcd-98cb355fe1bc", max_attempts=4, backoff_base=10,
                 )
         self.assertEqual([c.args[0] for c in mock_sleep.call_args_list], [10, 20, 30])
 
