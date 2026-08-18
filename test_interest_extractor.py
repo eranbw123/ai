@@ -288,6 +288,30 @@ def make_candidate(key, theme_keys, **kw):
 
 
 class TestReducePlumbing(unittest.TestCase):
+    def test_reduce_cli_can_bound_the_theme_list(self):
+        """`run_reduce` always accepted max_themes; until now nothing on the
+        CLI could set it, so an unattended nightly caller had no way to keep
+        the request inside what claude.ai will answer. Measured on the real
+        corpus 2026-08-18: 838 themes and 400 themes both came back as an
+        empty completion within ten seconds, 60 themes reduced fine."""
+        args = ie.build_parser().parse_args(["reduce", "--max-themes", "60"])
+        self.assertEqual(args.max_themes, 60)
+
+    def test_reduce_cli_default_leaves_hand_runs_unchanged(self):
+        args = ie.build_parser().parse_args(["reduce"])
+        self.assertEqual(args.max_themes, ie.DEFAULT_MAX_THEMES)
+
+    def test_build_reduce_prompt_honours_the_cap(self):
+        themes = ie.aggregate_themes(
+            spread("Topic", 1, start_days_ago=10, span_days=1, prefix="t", domain="tech",
+                   quote="q"), now=NOW)
+        themes = themes * 50   # 50 identical theme dicts is enough to cut
+        small, _ctx_s = ie.build_reduce_prompt(themes, [], set(), max_themes=5)
+        big, _ctx_b = ie.build_reduce_prompt(themes, [], set(), max_themes=50)
+        payload_small = len(small) + len(_ctx_s or "")
+        payload_big = len(big) + len(_ctx_b or "")
+        self.assertLess(payload_small, payload_big)
+
     def test_parse_map_reply_is_tolerant(self):
         reply = {"conversations": [
             {"index": 0, "topics": [{"label_en": "Good", "depth": "0.7", "register": "nonsense"}]},
