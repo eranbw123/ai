@@ -97,6 +97,39 @@ artifact (topic summary) for consumption by other repos.
    `python export_to_sqlite.py chatgpt`, or `python resilient_import.py
    chatgpt` for a chunked backfill.
 
+## Backfilling the full corpus
+
+`export_to_sqlite.py` keeps the corpus current; `corpus_backfill.py` is for
+making it *complete*, which is a different job. It runs in two phases so the
+expensive one always works off a fixed, inspectable plan:
+
+```
+python corpus_backfill.py --db conversations.db manifest   # cheap: list everything the servers have
+python corpus_backfill.py --db conversations.db run        # slow: fetch what is missing
+python corpus_backfill.py --db conversations.db status     # offline completeness report
+```
+
+`run` is resumable and idempotent — rerun the same command to continue. It
+processes newest-first, commits after every single conversation, skips anything
+already up to date without issuing a request, and appends one line per outcome
+to `backfill_progress.jsonl`.
+
+It is deliberately slow and polite: jittered delays, a longer pause every 25
+conversations, and an exponential back-off that treats any rate-limit signal as
+a reason to get much slower rather than to retry. It opens its **own** Chrome
+tab and closes only that tab, so it can share a browser with other tooling.
+
+Two things it handles that a flat-list walk does not:
+
+- **ChatGPT Projects.** Conversations inside a project are not reliably in
+  `/backend-api/conversations`, so projects are enumerated separately and
+  merged. Each conversation's project is recorded in the `conversation_projects`
+  table.
+- **Empty responses that are not empty.** The project-conversations endpoint
+  returns a `200` with `{"items": []}` for a page size above its cap, so page
+  sizes are pinned and an unexpectedly empty first page is retried before being
+  believed.
+
 ## Tests
 
 Offline unit tests only (stub CDP/Chrome, Telegram, Anthropic, network):
@@ -118,6 +151,8 @@ check for `council_bot.py`, run by hand — it's not part of the offline suite.
   only DB write path; reused by the poller and importers).
 - `poll_conversations.py` — continuous polling wrapper around the exporters.
 - `resilient_import.py` — chunked/supervised backfill runner.
+- `corpus_backfill.py` — slow, resumable, project-aware corpus completeness
+  backfill (see above).
 - `council_bot.py` / `e2e_verify_bot.py` — Telegram council bridge and its
   mock E2E check.
 - `view_conversations_server.py` — read-only local web viewer.

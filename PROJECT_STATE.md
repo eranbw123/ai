@@ -4,7 +4,7 @@ Updated 2026-08-11. Imported by `CLAUDE.md`; maintained under its startup and
 token-efficiency rules. Current state only — not a log, not an architecture doc.
 
 ## Implemented
-Claude + ChatGPT export via CDP → SQLite; continuous poller; Telegram council bot; read-only web viewer (ngrok-exposed); one-off markdown→SQLite migration (done, no longer needed); resilient chunked-import supervisor; privacy-safe `personal_state.py` (interest = normalized frequency, v1 contract); `knowledge_state.py` (familiarity = exposure × temporal spread × recency decay, structurally distinct from interest) plus `eval_knowledge_state.py`, a frozen TOKEN-level replay-eval harness (does familiarity rank future token recurrence better than interest weight?). `eval_future_self.py` is a second, separate frozen ARTIFACT-level replay-eval harness: does the frozen personal-state top-10 topic set at a historical T predict post-T conversations' titles (hit@10 vs. permutation-chance and recency baselines)? See `FUTURE_SELF_EXPERIMENT.md`.
+Claude + ChatGPT export via CDP → SQLite; continuous poller; Telegram council bot; read-only web viewer (ngrok-exposed); one-off markdown→SQLite migration (done, no longer needed); resilient chunked-import supervisor; `corpus_backfill.py`, the slow/resumable/project-aware completeness backfill (own section below); privacy-safe `personal_state.py` (interest = normalized frequency, v1 contract); `knowledge_state.py` (familiarity = exposure × temporal spread × recency decay, structurally distinct from interest) plus `eval_knowledge_state.py`, a frozen TOKEN-level replay-eval harness (does familiarity rank future token recurrence better than interest weight?). `eval_future_self.py` is a second, separate frozen ARTIFACT-level replay-eval harness: does the frozen personal-state top-10 topic set at a historical T predict post-T conversations' titles (hit@10 vs. permutation-chance and recency baselines)? See `FUTURE_SELF_EXPERIMENT.md`.
 
 `interest_extractor.py` — the interest-intelligence producer (design doc 2026-08-17, PR G): a two-stage LLM pass over conversation BODIES (`map` per conversation -> `digests.db`, `reduce` over the aggregate) that emits evidence-bearing interest candidates as a **contract v2** artifact (`interest_candidates.json`) for `internet`'s `discovery/offers.py`. All LLM traffic goes through `claude_browser.py` (claude.ai in a logged-in Chrome tab over CDP) — **no `anthropic` import, no API key, ever** on this path.
 
@@ -30,6 +30,35 @@ Claude + ChatGPT export via CDP → SQLite; continuous poller; Telegram council 
 Personal-state contract (schema + version-bump procedure): `PERSONAL_STATE_CONTRACT.md`, v1 for `personal_state.json` plus a **v2** section for the extractor's `interest_candidates.json` (adds evidence quotes + `conversation_id`s; v1's tokens-only privacy invariant is deliberately relaxed there, per the owner). Knowledge-state pre-registration + results: `KNOWLEDGE_STATE_EXPERIMENT.md`. Future-self pre-registration + results: `FUTURE_SELF_EXPERIMENT.md`.
 
 Weak-label definitions/thresholds/record schema/regenerate command: `WEAK_LABELS.md`.
+## Corpus backfill (`corpus_backfill.py`)
+Two phases, so the expensive phase always works off a fixed, inspectable plan:
+`manifest` (cheap listing) then `run` (one detail fetch per missing
+conversation, resumable, commits after every single one). `status` reports
+completeness with no browser.
+
+Measured live 2026-08-18, and the reason this exists separately from
+`export_to_sqlite.py`:
+- **ChatGPT Projects are invisible to the flat list.** 57 projects exist on this
+  account. `/backend-api/conversations` carries `gizmo_id` for only some of
+  their conversations; others are absent from it entirely (checked against a
+  flat page spanning the same dates, so it is not a paging artifact). Projects
+  are walked separately via `gizmos/snorlax/sidebar` +
+  `gizmos/{id}/conversations` and merged into one manifest. `?gizmo_id=` on
+  the flat endpoint is silently ignored, so it is not an alternative.
+- **That project endpoint returns HTTP 200 `{"items": []}` for any `limit`
+  above its cap** — 100 gives 0 items where 50/28/20 all give the same 6. A
+  first pass at limit=100 therefore reported all 57 projects as empty.
+  `PROJECT_CONVERSATIONS_PAGE_LIMIT` pins it to 50, and an empty *first* page is
+  retried before being believed.
+- **The Claude June/July 2026 gap is real, not an import bug.** claude.ai's own
+  `chat_conversations_v2` returns 157 conversations total: 9 in April, 6 in May,
+  142 in August, zero in June/July — and the DB already matched April/May
+  exactly. Claude Code sessions never create claude.ai conversations, so a
+  stretch of Claude-heavy work legitimately leaves no rows here. Do not "fix" it.
+- Project attribution lands in `conversation_projects`, a purely additive side
+  table rather than a new column on `raw_conversations`, so nothing already
+  reading that table can be affected.
+
 ## Adding a CLI flag (recurring task — no file reads needed)
 Each script builds its own `argparse.ArgumentParser` inside `main()`. Flags that
 `poll_conversations.py` must forward are read off `args` with
@@ -37,10 +66,11 @@ Each script builds its own `argparse.ArgumentParser` inside `main()`. Flags that
 passes a `types.SimpleNamespace` rather than a parsed argparse result.
 
 ## Known issues
-- The corpus is incomplete and is being backfilled by a **separate import agent** (worktree `C:/github/ai-wt-import`, branch `corpus/import-backfill`) which is now the sole writer of `conversations.db`. At 2026-08-18: 263 conversations (chatgpt 242 of ~1,630; claude 21), newest 2026-08-06, Claude June+July 2026 entirely absent.
-- ChatGPT **Projects** conversations are missing from the corpus: 57 projects exist in the account, and 13 of the 14 conversations in the 5 newest projects are absent from `/backend-api/conversations` (the flat history the importer walks) despite falling inside its window. They are reachable at `/backend-api/gizmos/{gizmo_id}/conversations?limit=&cursor=`, and the project list at `/backend-api/gizmos/snorlax/sidebar` (cursor-paginated). Owned by the import agent, not by this repo's extractor.
+- The corpus is being completed by a **separate import agent** (worktree `C:/github/ai-wt-import`, branch `corpus/import-backfill`), which is the sole writer of `conversations.db`. Measured on the servers 2026-08-18: **1898 conversations exist** (1740 chatgpt incl. 242 inside 57 Projects; 158 claude) against 263 in the DB at the start. Run/resume with `python corpus_backfill.py --db conversations.db run`.
+- ChatGPT **Projects** conversations are partly missing from `/backend-api/conversations`; `corpus_backfill.py` enumerates them separately and records each conversation's project in `conversation_projects`. See its section below.
+- **The Claude June/July 2026 gap is real, not an import defect** — claude.ai's own list returns 9 April, 6 May, 142 August and zero June/July, and the DB already matched April and May exactly. Claude Code sessions never create claude.ai conversations. Do not "fix" it.
 - Anything the extractor derives is only as complete as the corpus; `interest_candidates.json` therefore carries a `corpus` block (counts, date range, coverage) so a candidate generated from a partial history is not mistaken for one generated from all of it.
-- Under chatgpt.com throttling, CDP runs die with `WinError 10053` / "WebSocket connection closed". Stop `poll_conversations.py` before a big backfill — its polling compounds the rate limit.
+- Under chatgpt.com throttling, CDP runs die with `WinError 10053` / "WebSocket connection closed". Stop `poll_conversations.py` before a big backfill — its polling compounds the rate limit. `corpus_backfill.py` reopens its own tab and retries the item instead of dying.
 
 ## Next task
 Both evals are done. The extractor's `map` backfill has been run against the
@@ -61,6 +91,9 @@ Then hand `interest_candidates.json` to `internet`'s `discovery/offers.py`
 ```bash
 chrome --remote-debugging-port=9222   # required by every CDP script
 python resilient_import.py chatgpt
+python corpus_backfill.py --db conversations.db manifest   # refresh what the servers have
+python corpus_backfill.py --db conversations.db run        # slow, resumable; rerun to continue
+python corpus_backfill.py --db conversations.db status     # offline completeness report
 python council_bot.py                 # Telegram bridge; confirm council_bot.log is idle first
 python view_conversations_server.py   # read-only local viewer
 python -m unittest discover -p "test_*.py"

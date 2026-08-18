@@ -534,7 +534,25 @@ def run_chatgpt(conn, args):
                 )
                 recent_retry_counts.append(stats["retries"] - retries_before)
                 created_at = norm_ts(gc.parse_api_timestamp(data.get("create_time")))
-                updated_at = norm_ts(gc.parse_api_timestamp(data.get("update_time")))
+                # Store the LIST page's update_time (conv_updated), not the
+                # detail response's. They are not the same value: measured
+                # across the 242 stored rows on 2026-08-18, 217 differed, the
+                # detail's being 1-2s newer every time -- the two endpoints
+                # stamp the conversation at slightly different moments. Storing
+                # the detail's while comparing against the list's -- which is
+                # the only thing the skip-cache above *can* compare against,
+                # since the list is all it has before deciding whether to fetch
+                # -- meant the two could never agree, so "unchanged, cached --
+                # no fetch" fired for just 25 of those 242 rows and every full
+                # pass re-requested nearly the whole history anyway. That is
+                # exactly the repeated-full-pass request volume that escalated
+                # chatgpt.com's throttling in the 2026-08-05/06 incident, i.e.
+                # the skip-cache was not actually skipping. Sourcing the stored
+                # value from the same endpoint the comparison uses is what
+                # makes it real. No fidelity is lost: raw_json keeps the detail
+                # response verbatim, and a watermark 1-2s behind can only ever
+                # cause a harmless re-fetch, never a missed update.
+                updated_at = conv_updated or norm_ts(gc.parse_api_timestamp(data.get("update_time")))
                 # The per-conversation detail fetch (data) returns title=null for
                 # conversations too fresh for ChatGPT to have finished generating a
                 # title server-side yet, even though the list page (conv) already has

@@ -25,3 +25,5 @@ digests.db
 digests.db-shm
 digests.db-wal
 interest_candidates.json
+backfill_manifest.json
+backfill_progress.jsonl
