@@ -360,7 +360,14 @@ def build_manifest(port, sources, pacer):
                 prev[field] = entry[field]
         if entry.get("project_id") and not prev.get("project_id"):
             prev["project_id"] = entry["project_id"]
-            prev["project_name"] = entry.get("project_name")
+        # The id and the name are filled in independently, because the flat
+        # list supplies a bare `gizmo_id` with no name while only the project
+        # walk knows what that project is called. Gating the name on the id
+        # still being unset meant the flat sighting (which always comes first)
+        # permanently locked in project_name=None: 215 of 245 attributions lost
+        # their name that way, i.e. nearly all of the signal worth having.
+        if entry.get("project_name") and not prev.get("project_name"):
+            prev["project_name"] = entry["project_name"]
 
     if "chatgpt" in sources:
         with own_tab(port, "https://chatgpt.com/robots.txt") as conn:
@@ -398,6 +405,15 @@ def build_manifest(port, sources, pacer):
             for conv in convs:
                 add(_entry("claude", conv))
 
+    # Last resort for a name: a conversation can carry a project id that the
+    # project walk never emitted it under (it only lists a project's *current*
+    # conversations), so resolve anything still unnamed against the project
+    # roster we just built.
+    names = {p["id"]: p["name"] for p in manifest["projects"] if p.get("name")}
+    for entry in manifest["entries"]:
+        if entry.get("project_id") and not entry.get("project_name"):
+            entry["project_name"] = names.get(entry["project_id"])
+
     manifest["entries"].sort(key=lambda e: (e["updated_at"] or ""), reverse=True)
     return manifest
 
@@ -432,6 +448,25 @@ def record_project(conn, source, conversation_id, project_id, project_name):
                recorded_at = datetime('now')""",
         (source, conversation_id, project_id, project_name),
     )
+
+
+def sync_projects(conn, manifest):
+    """Record every project attribution the manifest knows, up front.
+
+    Project membership comes entirely from the listing phase, so there is no
+    reason to make it wait on the slow per-conversation fetch loop: a run that
+    is interrupted after ten conversations should still leave the full project
+    map behind, and a conversation already imported by an earlier tool should
+    still get attributed without being re-fetched. Costs no network at all.
+    """
+    recorded = 0
+    for entry in manifest["entries"]:
+        if entry.get("project_id"):
+            record_project(conn, entry["source"], entry["conversation_id"],
+                           entry["project_id"], entry.get("project_name"))
+            recorded += 1
+    conn.commit()
+    return recorded
 
 
 def stored_updated_at(conn):
@@ -564,6 +599,8 @@ def _row_from(source, entry, data):
 def run(conn, manifest, *, port, sources, since, pacer, progress_path,
         max_items=None, max_runtime_minutes=None, max_attempts_per_item=2,
         sleeper=time.sleep, client_factory=SourceClient):
+    recorded = sync_projects(conn, manifest)
+    print(f"backfill: recorded {recorded} project attributions from the manifest")
     stored = stored_updated_at(conn)
     todo = pending_entries(manifest, stored, sources=sources, since=since)
     if max_items:

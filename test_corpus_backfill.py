@@ -190,6 +190,30 @@ class TestManifestMerge(unittest.TestCase):
         self.assertEqual(proj_entry["project_name"], "Novo")
         self.assertEqual(manifest["projects"][0]["conversation_count"], 1)
 
+    def test_flat_sighting_first_does_not_lock_in_a_nameless_project(self):
+        """The flat list supplies a bare gizmo_id with no name and is always
+        walked first; only the project walk knows the name. Gating the name on
+        the id being unset lost the name for 215 of 245 attributions."""
+        manifest = self._build(
+            flat=[gpt_summary("c1", "Investments chat", gizmo_id="g-p-1")],
+            projects=[{"id": "g-p-1", "name": "invesments",
+                       "conversations": [gpt_summary("c1", "Investments chat",
+                                                     gizmo_id="g-p-1")]}],
+        )
+        self.assertEqual(len(manifest["entries"]), 1)
+        self.assertEqual(manifest["entries"][0]["project_name"], "invesments")
+
+    def test_unnamed_project_id_is_resolved_from_the_project_roster(self):
+        """A conversation can carry a gizmo_id the project walk never emitted
+        it under, since a project only lists its current conversations."""
+        manifest = self._build(
+            flat=[gpt_summary("c1", "Older investments chat", gizmo_id="g-p-1")],
+            projects=[{"id": "g-p-1", "name": "invesments", "conversations": []}],
+        )
+        entry = manifest["entries"][0]
+        self.assertEqual(entry["project_id"], "g-p-1")
+        self.assertEqual(entry["project_name"], "invesments")
+
     def test_conversation_in_both_appears_once_and_keeps_its_project(self):
         manifest = self._build(
             flat=[gpt_summary("both-1", "Seen twice", update="2026-08-10T00:00:00Z")],
@@ -513,6 +537,45 @@ class TestStatusReport(unittest.TestCase):
             report = cb.status_report(conn, manifest)
             self.assertIn("Novo: 1", report)
             self.assertIn("2 conversations on the servers, 1 still to fetch", report)
+        finally:
+            conn.close()
+
+
+class TestSyncProjects(unittest.TestCase):
+    """Project membership is known from the listing phase alone, so it must not
+    depend on the slow fetch loop reaching each conversation."""
+
+    def test_records_attributions_without_any_fetch(self):
+        conn = open_memory_db()
+        try:
+            manifest = {"entries": [
+                {"source": "chatgpt", "conversation_id": "c1", "title": "A",
+                 "created_at": None, "updated_at": "2026-08-01T00:00:00+00:00",
+                 "project_id": "g-p-1", "project_name": "invesments"},
+                {"source": "chatgpt", "conversation_id": "c2", "title": "B",
+                 "created_at": None, "updated_at": "2026-08-02T00:00:00+00:00",
+                 "project_id": None, "project_name": None},
+            ]}
+            self.assertEqual(cb.sync_projects(conn, manifest), 1)
+            self.assertEqual(
+                conn.execute("SELECT conversation_id, project_name FROM "
+                             "conversation_projects").fetchall(),
+                [("c1", "invesments")])
+        finally:
+            conn.close()
+
+    def test_corrects_a_previously_nameless_attribution(self):
+        conn = open_memory_db()
+        try:
+            cb.record_project(conn, "chatgpt", "c1", "g-p-1", None)
+            manifest = {"entries": [
+                {"source": "chatgpt", "conversation_id": "c1", "title": "A",
+                 "created_at": None, "updated_at": "2026-08-01T00:00:00+00:00",
+                 "project_id": "g-p-1", "project_name": "invesments"}]}
+            cb.sync_projects(conn, manifest)
+            self.assertEqual(
+                conn.execute("SELECT project_name FROM conversation_projects").fetchone(),
+                ("invesments",))
         finally:
             conn.close()
 
