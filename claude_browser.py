@@ -45,6 +45,25 @@ from claude_export_cdp import require_org_id
 DEFAULT_PORT = 9222
 DEFAULT_MODEL = "claude-opus-5"
 
+# Every completion is a real claude.ai conversation, created under this title
+# and deleted afterwards. Deletion is best-effort (a failed cleanup must never
+# fail an otherwise-good call), so some of them survive on claude.ai -- and a
+# conversation importer walking the account will pick them up like any other
+# conversation. That matters more here than it does for council_bot: these
+# scratch prompts contain conversation BODIES, so importing one would feed the
+# extractor its own input back as corpus. Observed live on 2026-08-18, in the
+# import agent's backfill manifest, mid-backfill.
+#
+# Same shape as export_to_sqlite.COUNCIL_BOT_TITLE_PREFIX, and used the same
+# way: match on the prefix and skip. Any importer of this account should call
+# is_scratch_conversation() alongside is_council_bot_scratch_conversation().
+SCRATCH_TITLE_PREFIX = "interest-extractor scratch"
+
+
+def is_scratch_conversation(title):
+    """True if `title` is one of this module's own throwaway conversations."""
+    return bool(title) and title.startswith(SCRATCH_TITLE_PREFIX)
+
 # Bound on the "is the tab reachable at all" check -- a port that accepts
 # connections but never answers must not hang a preflight forever. Real
 # completions use their own, much longer timeouts.
@@ -277,7 +296,7 @@ class BrowserClaude:
         conv_id = str(uuid.uuid4())
         started = time.monotonic()
         try:
-            conn.evaluate(js_ensure_conversation(org_id, conv_id, "interest-extractor scratch"), timeout=30)
+            conn.evaluate(js_ensure_conversation(org_id, conv_id, SCRATCH_TITLE_PREFIX), timeout=30)
             file_uuid = None
             if context:
                 file_uuid = conn.evaluate(js_upload_context_file(org_id, conv_id, context), timeout=120)

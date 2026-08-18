@@ -64,7 +64,7 @@ from pathlib import Path
 
 import export_to_sqlite as ets
 import personal_state as ps
-from claude_browser import BrowserClaude, BrowserClaudeError
+from claude_browser import BrowserClaude, BrowserClaudeError, is_scratch_conversation
 from chatgpt_export import convert_to_markdown as chatgpt_convert_to_markdown
 from claude_export import convert_to_markdown as claude_convert_to_markdown
 
@@ -345,8 +345,12 @@ def read_corpus(conn):
     open conversations.db with mode=ro, and the import agent is its only
     writer.
 
-    council_bot.py's own scratch conversations are excluded here, reusing the
-    import path's guard. They are normally filtered at import time, but rows
+    Two kinds of the machine's own chatter are excluded here: council_bot.py's
+    scratch conversations (reusing the import path's guard) and this module's
+    OWN scratch conversations (claude_browser.SCRATCH_TITLE_PREFIX), which are
+    real claude.ai conversations whose prompts contain conversation bodies --
+    importing one and then digesting it would feed the extractor its own input
+    back as evidence. They are normally filtered at import time, but rows
     that predate that guard are still in the DB (3 of them at time of
     writing) -- and they are precisely the conversations that must not shape
     interests, since they contain the machine's own deliberations rather than
@@ -358,7 +362,7 @@ def read_corpus(conn):
         "SELECT source, conversation_id, title, created_at, updated_at, content_hash, raw_json "
         "FROM raw_conversations ORDER BY id"
     ):
-        if ets.is_council_bot_scratch_conversation(r[2]):
+        if ets.is_council_bot_scratch_conversation(r[2]) or is_scratch_conversation(r[2]):
             continue
         rows.append({
             "source": r[0], "conversation_id": r[1], "title": r[2],
@@ -963,9 +967,23 @@ def attach_evidence(candidates, themes):
             "depth_max": max(depths),
             "class": classify_durability(span, len(months)),
         }
+        # Newest first, but at most one quote per conversation: four quotes
+        # from four different conversations show the owner a theme actually
+        # recurring, while four from one conversation just show that
+        # conversation four times. Provenance is the whole point of quoting.
+        seen_convs, picked = set(), []
+        for e in sorted(evidence, key=lambda e: (e["date"] or ""), reverse=True):
+            conv = e.get("conversation_id")
+            if conv and conv in seen_convs:
+                continue
+            seen_convs.add(conv)
+            picked.append(e)
+            if len(picked) >= MAX_EVIDENCE_QUOTES:
+                break
+
         cand = dict(cand)
         cand["durability"] = durability
-        cand["evidence"] = sorted(evidence, key=lambda e: (e["date"] or ""), reverse=True)[:MAX_EVIDENCE_QUOTES]
+        cand["evidence"] = picked
         cand["source_themes"] = [t["key"] for t in matched]
         cand["source_conversations"] = sorted(conv_ids)
         enriched.append(cand)

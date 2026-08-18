@@ -345,6 +345,16 @@ class TestReducePlumbing(unittest.TestCase):
         self.assertEqual(merged["durability"]["class"], "durable")
         self.assertTrue(ie.rank_candidates([merged])[0]["qualified"])
 
+    def test_evidence_quotes_come_from_distinct_conversations(self):
+        """Four quotes from four conversations is provenance; four from one
+        conversation is the same conversation four times."""
+        themes = ie.aggregate_themes(
+            spread("Isaac unlocks", 8, start_days_ago=200, span_days=180, prefix="iz",
+                   domain="gaming", quote="best unlock order"), now=NOW)
+        cand = ie.attach_evidence([make_candidate("iz", [themes[0]["key"]])], themes)[0]
+        convs = [e["conversation_id"] for e in cand["evidence"]]
+        self.assertEqual(len(convs), len(set(convs)))
+
     def test_invented_candidate_gets_no_durability_and_is_rejected(self):
         """A candidate the model made up, matching no theme, must not be able
         to claim evidence it does not have."""
@@ -533,6 +543,46 @@ class TestArtifact(unittest.TestCase):
             {"key": "k", "evidence": [{"quote": "כמה מגנזיום כדאי לקחת?"}]}]}
         back = json.loads(json.dumps(art, ensure_ascii=False))
         self.assertEqual(back["candidates"][0]["evidence"][0]["quote"], "כמה מגנזיום כדאי לקחת?")
+
+
+# --- loop closure: the machine's own chatter never becomes corpus -------------
+
+class TestScratchExclusion(unittest.TestCase):
+    """Both the council bot and this extractor create real claude.ai
+    conversations and delete them best-effort. A conversation importer walking
+    the account picks up the survivors, so they can land in conversations.db --
+    observed live 2026-08-18. Digesting one would feed the extractor its own
+    prompt (which contains conversation bodies) back as evidence.
+    """
+
+    def test_read_corpus_skips_both_kinds_of_scratch(self):
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        path = str(d / "c.db")
+        rows = [
+            {"conversation_id": "real", "title": "Steam Deck battery life",
+             "created_at": "2026-05-01T00:00:00+00:00",
+             "updated_at": "2026-05-01T00:00:00+00:00", "content_hash": "h1"},
+            {"conversation_id": "council", "title": "Council: what should I do about X",
+             "created_at": "2026-05-02T00:00:00+00:00",
+             "updated_at": "2026-05-02T00:00:00+00:00", "content_hash": "h2"},
+            {"conversation_id": "scratch", "title": "interest-extractor scratch",
+             "created_at": "2026-05-03T00:00:00+00:00",
+             "updated_at": "2026-05-03T00:00:00+00:00", "content_hash": "h3"},
+        ]
+        make_corpus_db(path, rows).close()
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            got = [r["conversation_id"] for r in ie.read_corpus(conn)]
+        finally:
+            conn.close()
+        self.assertEqual(got, ["real"])
+
+    def test_scratch_predicate_matches_the_title_actually_used(self):
+        import claude_browser as cb
+        self.assertTrue(cb.is_scratch_conversation(cb.SCRATCH_TITLE_PREFIX))
+        self.assertFalse(cb.is_scratch_conversation("A real conversation"))
+        self.assertFalse(cb.is_scratch_conversation(None))
 
 
 # --- acceptance: the clusters that today's interest set misses ----------------
