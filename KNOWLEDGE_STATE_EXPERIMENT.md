@@ -156,3 +156,85 @@ python eval_knowledge_state.py --db conversations.db --out knowledge_state_eval.
 (or point `--db` at the path held in `AI_CONVERSATIONS_DB` / wherever the
 owner's real export lives). Per the pre-registration, run it exactly once
 and record whatever verdict falls out mechanically.
+
+## Results (2026-08-18) -- the pre-registered run, on the real corpus
+
+The corpus became reachable (`conversations.db` in this clone's repo root,
+263 conversations / 3,858 messages). Per the pre-registration's stopping
+condition the harness was run exactly ONCE, with the frozen formula, the
+frozen 70/30 split, the frozen candidate rule, and seed 1234:
+
+```
+python eval_knowledge_state.py --db conversations.db --out knowledge_state_eval.json
+```
+
+**Observed (full report: `knowledge_state_eval.json`, gitignored):**
+
+| Quantity | Value |
+| --- | --- |
+| n_conversations | 263 (0 dropped for missing/unparseable `updated_at`) |
+| cutoff T | 2026-05-20T18:27:57Z |
+| n_candidates | 84 (tokens in >= 2 TRAIN conversations) |
+| n_pos / n_neg | 12 / 72 |
+| AUC(B0) interest weight | 0.5411 |
+| AUC(B1) recency alone | 0.5237 |
+| AUC(K1) familiarity | 0.5561 |
+| **dAUC = AUC(K1) - AUC(B0)** | **+0.0150** |
+| 95% bootstrap CI for dAUC | **[-0.1741, +0.1861]** (2000 resamples, 0 skipped) |
+| precision@20 B0 / K1 | 0.15 / 0.10 |
+
+**CORPUS SNAPSHOT THIS RESULT IS MEASURED AGAINST** (state it whenever these
+numbers are quoted -- the corpus is actively being backfilled, so a later,
+larger corpus is a different measurement, not a correction of this one):
+
+- 263 conversations: chatgpt 242, claude 21.
+- `created_at` range 2023-08-17 -> 2026-08-06; the newest row is ~12 days
+  behind wall clock at run time (2026-08-18), i.e. a head gap on both sources.
+- Known holes at run time: ChatGPT backfill ~15% complete (242 of ~1,630),
+  Claude June+July 2026 entirely absent (zero rows), and ChatGPT *Projects*
+  conversations never imported at all (57 projects exist in the account; a
+  flat-history importer does not see their conversations).
+
+**VERDICT: FALSIFIED.**
+
+Applied mechanically, no softening. The candidate set is large enough
+(84 >= 50) and both classes are populated (12 / 72), so this is not the
+INCONCLUSIVE branch. It is not SUPPORTED: dAUC is +0.0150, far below the
+pre-registered +0.05 threshold. It IS FALSIFIED on the CI clause -- the 95%
+bootstrap CI for dAUC spans zero by a wide margin ([-0.17, +0.19], i.e. an
+interval roughly 24x the size of the point estimate). `AUC(K1) > AUC(B1)`
+does hold (0.5561 vs 0.5237), so the composite is not beaten by recency
+alone, but the decision rule is a conjunction and one satisfied clause does
+not rescue it.
+
+Read plainly: all three rankings sit within ~0.06 of chance (0.50). On this
+corpus, at this split, familiarity does not rank future token recurrence
+meaningfully better than a raw TRAIN conversation count, and neither of them
+ranks it much better than a coin. The formula stands as pre-registered and
+is NOT to be retuned in response to this number (pre-registration, stopping
+condition).
+
+**Caveats that are part of the result, not excuses for it:**
+- The corpus is ~15% of the owner's real ChatGPT history (242 of ~1,630;
+  backfill stalled 2026-08-06). A larger corpus is a different measurement,
+  not a re-run of this one -- if the backfill completes, that would be a new
+  pre-registration, separately dated.
+- Only 12 of 84 candidate tokens are positive, so the AUC is estimated
+  against a small positive class; the wide CI is exactly that showing up.
+- The LABEL PROXY CAVEAT above applies unchanged.
+- Both signals are TITLE-token level. This result is evidence about title
+  tokens, not about the owner's interests as such -- which is the specific
+  motivation for the content-level extractor added in the same step
+  (`interest_extractor.py`), whose candidates are owner-approved offers
+  rather than an automatic scoring input.
+
+### Implication mapping now in force
+
+The FALSIFIED branch replaces the 2026-08-10 INCONCLUSIVE -- NO CORPUS
+branch. `knowledge_state`'s familiarity has now been measured against its
+own pre-registered baseline and did not clear it, so it must not be adopted
+as a scoring input by any consumer. Combined with the parallel FALSIFIED
+verdict in `FUTURE_SELF_EXPERIMENT.md` (2026-08-18), the standing adoption
+gate is not lifted -- it is now closed on measurement rather than open on a
+missing corpus. See that doc's implication mapping for the interest-weight
+side.
