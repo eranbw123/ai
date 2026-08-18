@@ -56,6 +56,17 @@ import cdp
 from chatgpt_export import convert_to_markdown as chatgpt_convert_to_markdown
 from claude_export import convert_to_markdown as claude_convert_to_markdown
 from claude_export_cdp import require_org_id
+# The claude.ai browser round trip lives in claude_browser.py so that
+# interest_extractor.py can drive claude.ai without importing this module
+# (and therefore `anthropic`). Re-exported here because this module is
+# still where they are patched/imported from.
+from claude_browser import (  # noqa: F401
+    js_delete_conversation,
+    js_ensure_conversation,
+    js_send_completion,
+    js_upload_context_file,
+    parse_completion_result,
+)
 from common import REPO_ROOT, load_env_local
 
 DB_PATH = REPO_ROOT / "conversations.db"
@@ -344,153 +355,8 @@ def ask_council(client, question, context_text):
     return extract_final_call(text)
 
 
-def js_ensure_conversation(org_id, conv_id, name):
-    """Create a scratch claude.ai conversation. 400/409 (already exists) is fine."""
-    name_json = json.dumps(name)
-    return f"""
-(async () => {{
-  const res = await fetch('https://claude.ai/api/organizations/{org_id}/chat_conversations', {{
-    method: 'POST',
-    credentials: 'include',
-    headers: {{ 'Content-Type': 'application/json', Accept: 'application/json' }},
-    body: JSON.stringify({{
-      uuid: '{conv_id}',
-      name: {name_json},
-      include_conversation_preferences: true,
-      is_temporary: false
-    }})
-  }});
-  if (!res.ok && res.status !== 400 && res.status !== 409) {{
-    throw new Error('create conversation HTTP ' + res.status + ': ' + await res.text());
-  }}
-  return true;
-}})()
-"""
-
-
-def js_upload_context_file(org_id, conv_id, context_text):
-    """Attach `context_text` to the conversation as a text-file upload (rather
-    than pasting ~100K+ chars inline -- matches how claude.ai's own web client
-    handles large pastes). Returns the file_uuid, or null if the upload failed
-    (endpoint shape reverse-engineered and may not match exactly)."""
-    context_json = json.dumps(context_text)
-    return f"""
-(async () => {{
-  const CONTEXT_TEXT = {context_json};
-  const blob = new Blob([CONTEXT_TEXT], {{ type: 'text/plain' }});
-  const form = new FormData();
-  form.append('file', blob, 'exported_conversations.txt');
-  const res = await fetch(`https://claude.ai/api/organizations/{org_id}/conversations/{conv_id}/wiggle/upload-file`, {{
-    method: 'POST',
-    credentials: 'include',
-    body: form
-  }});
-  if (!res.ok) return null;
-  const uploaded = await res.json();
-  return uploaded.file_uuid || uploaded.id || null;
-}})()
-"""
-
-
-def js_send_completion(org_id, conv_id, prompt, model, tools, file_uuid):
-    """Send `prompt` (with `file_uuid` attached, if any) and read the streamed
-    reply back as plain text. Payload fields and SSE framing are
-    reverse-engineered from cyber-wojtek/Claude-API's
-    claude_webapi/{client,session}.py -- undocumented and may drift; see the
-    backend note in the module docstring."""
-    prompt_json = json.dumps(prompt)
-    model_json = json.dumps(model)
-    tools_json = json.dumps(tools)
-    file_uuid_json = json.dumps(file_uuid)
-    return f"""
-(async () => {{
-  const fileUuid = {file_uuid_json};
-  const payload = {{
-    attachments: [],
-    files: fileUuid ? [fileUuid] : [],
-    locale: 'en-US',
-    model: {model_json},
-    parent_message_uuid: '00000000-0000-4000-8000-000000000000',
-    prompt: {prompt_json},
-    rendering_mode: 'messages',
-    sync_sources: [],
-    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    tools: {tools_json},
-    turn_message_uuids: {{
-      human_message_uuid: crypto.randomUUID(),
-      assistant_message_uuid: crypto.randomUUID()
-    }}
-  }};
-  const res = await fetch(`https://claude.ai/api/organizations/{org_id}/chat_conversations/{conv_id}/completion`, {{
-    method: 'POST',
-    credentials: 'include',
-    headers: {{ 'Content-Type': 'application/json', Accept: 'text/event-stream' }},
-    body: JSON.stringify(payload)
-  }});
-  if (!res.ok) throw new Error('completion HTTP ' + res.status + ': ' + await res.text());
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = '';
-  let text = '';
-  let messageLimit = null;
-  while (true) {{
-    const {{ done, value }} = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, {{ stream: true }});
-    const lines = buf.split('\\n');
-    buf = lines.pop();
-    for (const line of lines) {{
-      if (!line.startsWith('data:')) continue;
-      const payloadLine = line.slice(5).trim();
-      if (!payloadLine || payloadLine === '[DONE]') continue;
-      let evt;
-      try {{ evt = JSON.parse(payloadLine); }} catch (e) {{ continue; }}
-      if (evt.type === 'content_block_delta' && evt.delta && evt.delta.type === 'text_delta') {{
-        text += evt.delta.text;
-      }} else if (typeof evt.completion === 'string') {{
-        text = evt.completion;
-      }} else if (evt.type === 'message_limit') {{
-        // Usage-window metadata, not part of the answer -- kept out of `text`
-        // so it never leaks into what gets sent to Telegram.
-        messageLimit = evt;
-      }}
-    }}
-  }}
-  return JSON.stringify({{ text, messageLimit }});
-}})()
-"""
-
-
-def js_delete_conversation(org_id, conversation_uuid):
-    return f"""
-(async () => {{
-  await fetch('https://claude.ai/api/organizations/{org_id}/chat_conversations/{conversation_uuid}', {{
-    method: 'DELETE',
-    credentials: 'include'
-  }});
-  return true;
-}})()
-"""
-
-
 def default_log(message, err=False):
     print(message, file=sys.stderr if err else sys.stdout)
-
-
-def parse_completion_result(raw):
-    """Parse whatever conn.evaluate() handed back for js_send_completion.
-
-    js_send_completion's JS always returns `JSON.stringify({text,
-    messageLimit})` -- a string -- so this is normally just json.loads(raw).
-    But at least one Chrome/CDP combination has been observed handing the
-    value back already deserialized into a dict instead of the JSON string
-    (json.loads(a_dict) then blows up with a confusing TypeError). Accept
-    both shapes rather than crashing the whole question on it.
-    """
-    if isinstance(raw, dict):
-        return raw
-    return json.loads(raw)
 
 
 def ask_council_browser(question, context_text, port=9222, log=default_log):

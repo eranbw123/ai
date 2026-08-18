@@ -192,3 +192,108 @@ arrow.
   change `CONTRACT_VERSION` (still `1`), and `personal_state.py`,
   `knowledge_state.py`, `eval_knowledge_state.py`, and `eval_future_self.py`
   are unmodified by step-08.
+
+## v2 — evidence-bearing interest candidates (2026-08-18)
+
+**Produced by `interest_extractor.py`, not `personal_state.py`.**
+`personal_state.py` still emits `contract_version: 1` and its output is
+byte-identical to before; nothing about v1 changed. v2 is a strict superset
+written to a *different* artifact (`interest_candidates.json`), so a v1
+consumer that only knows `topics[]` keeps working untouched by reading
+either file.
+
+### What v2 adds
+
+Every v1 top-level key, plus:
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `contract_version` | `2` | |
+| `generator` | string | `"interest_extractor.py"` |
+| `corpus` | object | `conversations_in_db`, `conversations_digested`, `by_source`, `created_at_range`, `coverage` (0–1) |
+| `themes_considered` | int | aggregated themes before candidate selection |
+| `candidates` | array | the new payload, below |
+
+Each `candidates[]` entry:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `kind` | enum | `new` / `bridge` / `merge` / `split` / `revive` |
+| `key`, `title`, `description` | string | English, `interests.json` house style |
+| `positive_signals`, `negative_signals` | string[] | |
+| `suggested_min_score` | number\|null | a suggestion; the owner decides |
+| `parent_key`, `related_keys` | string / string[] | one-level hierarchy (§5.3) |
+| `evidence` | array | `{date, quote, lang, depth, conversation_id, title}` |
+| `durability` | object | `{n_convs, active_months, span_days, recency_days, depth_max, class}` |
+| `score`, `score_terms` | number, object | the §5.2 composite and every term, for the provenance UI |
+| `similarity_to_existing` | array | `{key, similarity}` per existing interest |
+| `max_similarity` | number | drives the `novelty` term |
+| `expected_yield`, `expected_yield_rationale` | number, string | model-rated |
+| `passes_durability_gate`, `qualified`, `offered` | bool | code-side floors (§5.2) |
+| `source_themes`, `conversation_ids`, `from_theme_keys` | string[] | provenance back to the corpus |
+
+`durability.class` is `durable` / `emerging` / `transient` per the design's
+**measured** separator: `durable` requires span ≥ 30 days AND ≥ 2 calendar
+months; `transient` is a single burst under 7 days. That split is not
+re-derived — it is the one measured over this corpus (69 durable vs 37
+single-burst tokens of 131).
+
+### Privacy invariant: deliberately relaxed, and why
+
+v1's invariant ("only aggregate tokens and counts; never full titles,
+message bodies, `raw_json`, or `conversation_id`s") **does not hold for v2**,
+by design and by the owner's explicit instruction. v2 carries:
+
+- verbatim `quote` snippets of the owner's **own** messages, ≤ 140 characters,
+  in their original language (Hebrew stays Hebrew);
+- `conversation_id` and conversation `title` on each evidence item;
+- conversation counts, dates, and spans.
+
+It still never carries `raw_json`, whole messages, or any assistant text.
+
+This is a considered trade, not an oversight: an offer the owner cannot
+trace back to the conversation that produced it is an offer they cannot
+judge, and the whole point of the offers inbox is a decision made in
+seconds. The design doc proposed dates-only evidence plus a `--no-quotes`
+flag; the owner overrode both — full provenance including conversation ids,
+and no redaction or opt-out mode. The artifact stays gitignored and
+machine-local, exactly like `personal_state.json`.
+
+Consumers that need the v1 posture should keep reading `personal_state.json`,
+which is unchanged and still tokens-only.
+
+### Adoption gate (unchanged, and now closed on evidence)
+
+Both pre-registered evals ran against the real corpus on 2026-08-18 and both
+recorded **FALSIFIED** (see `KNOWLEDGE_STATE_EXPERIMENT.md` and
+`FUTURE_SELF_EXPERIMENT.md`). So the step-05 gate is not lifted: `weight`
+(interest) and `familiarity` (knowledge-state) still may not be used as
+scoring inputs anywhere, now because they were measured and did not clear
+their own bar rather than because no corpus was reachable.
+
+v2's `candidates[]` are **not** covered by that gate and do not evade it.
+They are a different signal (LLM extraction over conversation bodies, not
+title-token frequency), and they are consumed as *human-approved offers*:
+the owner accepts, edits, or rejects each candidate before anything reaches
+the scorer. No field of a candidate may be used as an automatic scoring
+weight without its own pre-registered eval.
+
+### Version-bump procedure, as applied
+
+1. `personal_state.CONTRACT_VERSION` stays `1` — that producer's artifact is
+   unchanged. `interest_extractor.CONTRACT_VERSION` is `2`.
+2. This dated section is the v2 description; earlier sections are untouched.
+3. The `internet` repo's `discovery/personal_state.py` must extend
+   `SUPPORTED_VERSIONS` to `{1, 2}` before it reads the new artifact — that
+   is PR H's job, not this one's. Until then the artifact is simply written
+   and not consumed, which is the intended fail-soft state.
+
+### Loop closure (step-08) still holds
+
+The extractor reads `raw_conversations` and nothing else. No consumer output
+— no accept/reject decision, no delivery feedback, no discovery item — is an
+input to it. All learning from the owner's decisions happens on the consumer
+side (design §5.6). `council_bot.py`'s own scratch conversations are excluded
+from the corpus by `read_corpus()`, reusing the import path's
+`is_council_bot_scratch_conversation()` guard, so the machine's own
+deliberations can never shape the interests it proposes.

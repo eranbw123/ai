@@ -239,3 +239,88 @@ python eval_future_self.py --db conversations.db --out future_self_eval.json
 (or point `--db` at the path held in `AI_CONVERSATIONS_DB` / wherever the
 owner's real export lives). Per the pre-registration, run it exactly once
 and record whatever verdict falls out mechanically.
+
+## Results (2026-08-18) -- the pre-registered run, on the real corpus
+
+The corpus became reachable (`conversations.db` in this clone's repo root,
+263 conversations). Per the stopping condition the harness was run exactly
+ONCE, frozen split, K=10, 180-day window anchored at T, seed 1234:
+
+```
+python eval_future_self.py --db conversations.db --out future_self_eval.json
+```
+
+**Observed (full report: `future_self_eval.json`, gitignored):**
+
+| Quantity | Value |
+| --- | --- |
+| n_train / n_test | 184 / 79 (0 dropped rows) |
+| cutoff T | 2026-05-20T18:27:57Z |
+| candidate pool | 79 tokens |
+| INTEREST hit@10 | **0.0127** (1 of 79 post-T conversations) |
+| RECENCY hit@10 (B1) | 0.0253 |
+| chance mean permuted hit@10 (B0) | 0.0243 |
+| p_perm | **0.8061** |
+| effect size (INTEREST - chance) | **-0.0116** |
+| verdict emitted by the harness | **FALSIFIED** |
+
+**CORPUS SNAPSHOT THIS RESULT IS MEASURED AGAINST** (state it whenever these
+numbers are quoted -- the corpus is actively being backfilled, so a later,
+larger corpus is a different measurement, not a correction of this one):
+
+- 263 conversations: chatgpt 242, claude 21.
+- `created_at` range 2023-08-17 -> 2026-08-06; the newest row is ~12 days
+  behind wall clock at run time (2026-08-18), i.e. a head gap on both sources.
+- Known holes at run time: ChatGPT backfill ~15% complete (242 of ~1,630),
+  Claude June+July 2026 entirely absent (zero rows), and ChatGPT *Projects*
+  conversations never imported at all (57 projects exist in the account; a
+  flat-history importer does not see their conversations).
+
+**VERDICT: FALSIFIED.**
+
+Not INCONCLUSIVE: n_test = 79 >= 30, candidate pool = 79 >= 30, and the
+frozen artifact carried a full 10 topics. Both FALSIFIED clauses fire
+independently: p_perm = 0.806 is nowhere near < 0.05, and INTEREST hit@10
+(0.0127) is below RECENCY hit@10 (0.0253).
+
+The frozen top-10 interest set did **worse than drawing 10 tokens at
+random** from the same pool (0.0127 vs a 0.0243 permuted mean), and worse
+than simply taking the 10 most recently seen tokens. The most-frequent title
+tokens as of 2026-05-20 predicted essentially nothing about which
+conversations the owner would have next. This is a clean falsification, and
+per the pre-registration that is a successful outcome for the step -- the
+split, window, K, and baselines are not to be retuned in response to it.
+
+Worth stating because it is the mechanism, not a caveat: the corpus turns
+over faster than a frequency ranking tracks. Title tokens that dominated a
+180-day window are largely spent by the time the next 79 conversations
+happen; the owner moves onto new themes (the gaming cluster, supplements)
+that a backward-looking frequency count cannot anticipate. The same 15%
+backfill limitation noted in `KNOWLEDGE_STATE_EXPERIMENT.md`'s 2026-08-18
+results applies here too.
+
+### Implication mapping now in force
+
+Per the pre-registered IMPLICATION MAPPING: the **FALSIFIED** branch is in
+force, replacing the 2026-08-10 INCONCLUSIVE -- NO CORPUS branch.
+
+> later steps must treat personal-state topics as descriptive-only and must
+> not give them predictive weight in any scoring/recommendation consumer
+> (including `internet`'s `personal_state_top_terms` augmentation) without a
+> different validated signal.
+
+Concretely, and for consumers to rely on:
+- `personal_state.py`'s `weight` and `knowledge_state.py`'s `familiarity`
+  remain barred as scoring inputs. The adoption gate is now closed on
+  evidence rather than pending on a missing corpus, and both evals are
+  spent -- neither may be re-run to try for a different answer.
+- The token ladder in `internet`'s `interest_state.py` should stay dormant
+  (which matches the owner's 2026-08-17 decision to leave it dormant once
+  offers ship).
+- `interest_extractor.py` (added in the same step) is NOT covered by this
+  bar and does not evade it: it is a *different signal* (LLM extraction over
+  conversation bodies, not title-token frequency), and its output is a
+  human-approved offer -- the owner accepts or rejects each candidate before
+  anything reaches the scorer. Nothing it derives is used as an automatic
+  scoring weight. If a future step wants to make extractor confidence itself
+  a scoring input, that needs its own pre-registered eval.

@@ -21,3 +21,7 @@ personal_state.json
 knowledge_state.json
 knowledge_state_eval.json
 future_self_eval.json
+digests.db
+digests.db-shm
+digests.db-wal
+interest_candidates.json
