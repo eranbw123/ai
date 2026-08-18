@@ -58,6 +58,7 @@ from pathlib import Path
 
 import cdp
 import chatgpt_export_cdp as gc
+import claude_browser
 import claude_export_cdp as cc
 from chatgpt_export import parse_api_timestamp as gpt_ts
 from claude_export import parse_api_timestamp as claude_ts
@@ -478,6 +479,55 @@ def stored_updated_at(conn):
     }
 
 
+def is_agent_scratch(title):
+    """True if `title` belongs to one of our own agents' throwaway conversations.
+
+    Two separate producers, both of which create real conversations on the live
+    account that would otherwise import like any other: council_bot.py's
+    per-question scratch conversations, and claude_browser.py's interest
+    extractor. Importing either is a correctness bug, not just noise -- their
+    prompts contain conversation bodies, so a scratch conversation carries the
+    corpus back into the corpus and hands a later derivation its own earlier
+    output as if it were the owner's material. Checked here at the point where
+    work is queued, so such a conversation is never even fetched.
+
+    Not merely theoretical: an 'interest-extractor scratch' conversation was
+    the first row this backfill imported on 2026-08-18, before this guard
+    existed, and had to be deleted.
+    """
+    return bool(title) and (
+        is_council_bot_scratch_conversation(title)
+        or claude_browser.is_scratch_conversation(title)
+    )
+
+
+def purge_agent_scratch(conn):
+    """Delete any agent scratch conversation already in the corpus.
+
+    The queue-time guard above stops new ones; this removes any that a run
+    predating the guard already wrote. Returns what it deleted so the caller
+    can report it rather than silently mutating the corpus.
+    """
+    doomed = [
+        (source, cid, title)
+        for source, cid, title in conn.execute(
+            "SELECT source, conversation_id, title FROM raw_conversations"
+        )
+        if is_agent_scratch(title)
+    ]
+    for source, cid, _title in doomed:
+        conn.execute(
+            "DELETE FROM raw_conversations WHERE source = ? AND conversation_id = ?",
+            (source, cid),
+        )
+        conn.execute(
+            "DELETE FROM conversation_projects WHERE source = ? AND conversation_id = ?",
+            (source, cid),
+        )
+    conn.commit()
+    return doomed
+
+
 def same_instant(stored_value, manifest_value):
     """True if two stored timestamps denote the same moment.
 
@@ -515,7 +565,7 @@ def pending_entries(manifest, stored, *, sources=None, since=None):
             continue
         if since and (entry["updated_at"] or "") < since:
             continue
-        if is_council_bot_scratch_conversation(entry.get("title")):
+        if is_agent_scratch(entry.get("title")):
             continue
         key = (entry["source"], entry["conversation_id"])
         if same_instant(stored.get(key), entry["updated_at"]):
@@ -599,6 +649,8 @@ def _row_from(source, entry, data):
 def run(conn, manifest, *, port, sources, since, pacer, progress_path,
         max_items=None, max_runtime_minutes=None, max_attempts_per_item=2,
         sleeper=time.sleep, client_factory=SourceClient):
+    for source, cid, title in purge_agent_scratch(conn):
+        print(f"backfill: removed agent scratch conversation {source}/{cid} {title!r}")
     recorded = sync_projects(conn, manifest)
     print(f"backfill: recorded {recorded} project attributions from the manifest")
     stored = stored_updated_at(conn)

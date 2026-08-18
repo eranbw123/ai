@@ -332,16 +332,25 @@ class TestPendingEntries(unittest.TestCase):
         pending = cb.pending_entries(self.manifest, {}, since="2026-06-01T00:00:00+00:00")
         self.assertEqual([e["conversation_id"] for e in pending], ["c", "a"])
 
-    def test_council_bot_scratch_is_never_queued(self):
-        """council_bot's own leftover scratch conversations must not enter the
-        corpus -- see is_council_bot_scratch_conversation()'s docstring for why
-        importing them is a correctness bug, not just noise."""
+    def test_agent_scratch_is_never_queued(self):
+        """Our own agents' scratch conversations must not enter the corpus:
+        their prompts contain conversation bodies, so importing one feeds a
+        later derivation its own earlier output as if it were the owner's."""
         from export_to_sqlite import COUNCIL_BOT_TITLE_PREFIX
+        from claude_browser import SCRATCH_TITLE_PREFIX
+        for prefix in (COUNCIL_BOT_TITLE_PREFIX, SCRATCH_TITLE_PREFIX):
+            manifest = {"entries": [{"source": "claude", "conversation_id": "s",
+                                     "title": prefix + " 12345",
+                                     "created_at": None, "updated_at": None,
+                                     "project_id": None, "project_name": None}]}
+            self.assertEqual(cb.pending_entries(manifest, {}), [], prefix)
+
+    def test_ordinary_titles_are_still_queued(self):
         manifest = {"entries": [{"source": "claude", "conversation_id": "s",
-                                 "title": COUNCIL_BOT_TITLE_PREFIX + " 12345",
+                                 "title": "A real conversation about scratch paper",
                                  "created_at": None, "updated_at": None,
                                  "project_id": None, "project_name": None}]}
-        self.assertEqual(cb.pending_entries(manifest, {}), [])
+        self.assertEqual(len(cb.pending_entries(manifest, {})), 1)
 
 
 class TestSameInstant(unittest.TestCase):
@@ -364,6 +373,46 @@ class TestSameInstant(unittest.TestCase):
                                  "project_id": None, "project_name": None}]}
         stored = {("claude", "c"): "2026-08-04T21:20:54.003049Z"}
         self.assertEqual(cb.pending_entries(manifest, stored), [])
+
+
+class TestPurgeAgentScratch(unittest.TestCase):
+    """The queue-time guard stops new ones; a run predating it already wrote
+    an 'interest-extractor scratch' row that had to come back out."""
+
+    def _insert(self, conn, cid, title):
+        conn.execute(
+            "INSERT INTO raw_conversations (source, conversation_id, title, created_at, "
+            "updated_at, raw_json, content_hash) VALUES ('claude', ?, ?, "
+            "'2026-08-18T00:00:00+00:00', '2026-08-18T00:00:00+00:00', '{}', ?)",
+            (cid, title, cid))
+
+    def test_removes_scratch_and_keeps_real_conversations(self):
+        from claude_browser import SCRATCH_TITLE_PREFIX
+        conn = open_memory_db()
+        try:
+            self._insert(conn, "s1", SCRATCH_TITLE_PREFIX + " abc")
+            self._insert(conn, "r1", "A real conversation")
+            cb.record_project(conn, "claude", "s1", "p1", "Proj")
+            removed = cb.purge_agent_scratch(conn)
+            self.assertEqual([r[1] for r in removed], ["s1"])
+            self.assertEqual(
+                [r[0] for r in conn.execute(
+                    "SELECT conversation_id FROM raw_conversations")], ["r1"])
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM conversation_projects").fetchone()[0], 0,
+                "the scratch row's project attribution must go too")
+        finally:
+            conn.close()
+
+    def test_is_a_no_op_on_a_clean_corpus(self):
+        conn = open_memory_db()
+        try:
+            self._insert(conn, "r1", "A real conversation")
+            self.assertEqual(cb.purge_agent_scratch(conn), [])
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM raw_conversations").fetchone()[0], 1)
+        finally:
+            conn.close()
 
 
 class TestRun(unittest.TestCase):
