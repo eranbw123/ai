@@ -990,7 +990,7 @@ def attach_evidence(candidates, themes):
     return enriched
 
 
-def rank_candidates(candidates, *, max_offers=MAX_OFFERS_PER_RUN):
+def rank_candidates(candidates, *, max_offers=MAX_OFFERS_PER_RUN, known_interest_keys=None):
     """Score, floor, and pick what to actually offer.
 
     Two floors, both from §5.2: the durability gate (measured, local) and the
@@ -1001,11 +1001,23 @@ def rank_candidates(candidates, *, max_offers=MAX_OFFERS_PER_RUN):
     The serendipity slot is a lane, not a weight: one exploratory candidate
     that cleared the floors is promoted even if it did not make the top five,
     so the inbox is never purely the safest picks.
+
+    `known_interest_keys`, when given, restricts which similarity ratings may
+    depress novelty -- to interests that actually exist. Measured on the first
+    real run: 6 of 84 similarity entries named a SIBLING CANDIDATE from the
+    same batch rather than an existing interest, which would have made a
+    genuinely novel candidate look like a duplicate of something the engine
+    does not follow. The consumer (offers.py) filters the same way; the full
+    unfiltered list still ships, for provenance.
     """
+    known = set(known_interest_keys) if known_interest_keys is not None else None
     scored = []
     for cand in candidates:
         theme_like = dict(cand["durability"])
-        max_sim = max((s["sim"] for s in cand["similarity_to_existing"]), default=0.0)
+        sims = cand["similarity_to_existing"]
+        if known is not None:
+            sims = [s for s in sims if s["key"] in known]
+        max_sim = max((s["sim"] for s in sims), default=0.0)
         score, terms = score_candidate(theme_like, expected_yield=cand["expected_yield"],
                                         max_similarity=max_sim)
         cand = dict(cand)
@@ -1089,7 +1101,8 @@ def run_reduce(conn, dconn, llm, *, interests_path=None, out_path=DEFAULT_OUT,
     reply = llm.complete_json(prompt, REDUCE_SHAPE, timeout=timeout, context=context)
     candidates = parse_reduce_reply(reply)
     candidates = attach_evidence(candidates, themes)
-    candidates = rank_candidates(candidates)[:max_candidates]
+    candidates = rank_candidates(
+        candidates, known_interest_keys={i["key"] for i in interests})[:max_candidates]
 
     artifact = build_artifact(conn, digests, themes, candidates)
     ps.write(out_path, artifact)

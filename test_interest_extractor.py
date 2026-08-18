@@ -367,6 +367,36 @@ class TestReducePlumbing(unittest.TestCase):
         self.assertFalse(ranked[0]["qualified"])
         self.assertFalse(ranked[0]["offered"])
 
+    def test_similarity_to_a_nonexistent_interest_does_not_depress_novelty(self):
+        """Measured on the first real run: 6 of 84 similarity entries named a
+        sibling CANDIDATE rather than an existing interest. Counting those
+        would make a genuinely novel theme look like a duplicate of something
+        the engine does not even follow. The consumer filters the same way."""
+        themes = ie.aggregate_themes(
+            spread("Isaac unlocks", 6, start_days_ago=200, span_days=150, prefix="iz",
+                   domain="gaming"), now=NOW)
+        cand = make_candidate("roguelikes", [themes[0]["key"]],
+                               similarity_to_existing=[{"key": "some-other-candidate", "sim": 0.95}])
+        enriched = ie.attach_evidence([cand], themes)
+
+        unfiltered = ie.rank_candidates(enriched)[0]
+        filtered = ie.rank_candidates(enriched, known_interest_keys={"a-real-interest"})[0]
+
+        self.assertAlmostEqual(unfiltered["max_similarity"], 0.95)
+        self.assertAlmostEqual(filtered["max_similarity"], 0.0)
+        self.assertGreater(filtered["score"], unfiltered["score"])
+        # The full list still ships, for provenance.
+        self.assertEqual(len(filtered["similarity_to_existing"]), 1)
+
+    def test_similarity_to_a_real_interest_still_counts(self):
+        themes = ie.aggregate_themes(
+            spread("Isaac unlocks", 6, start_days_ago=200, span_days=150, prefix="iz"), now=NOW)
+        cand = make_candidate("dupe", [themes[0]["key"]],
+                               similarity_to_existing=[{"key": "a-real-interest", "sim": 0.9}])
+        ranked = ie.rank_candidates(ie.attach_evidence([cand], themes),
+                                     known_interest_keys={"a-real-interest"})[0]
+        self.assertAlmostEqual(ranked["max_similarity"], 0.9)
+
     def test_rank_caps_offers_and_keeps_the_serendipity_slot(self):
         themes = []
         cands = []
