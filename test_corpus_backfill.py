@@ -338,12 +338,27 @@ class TestPendingEntries(unittest.TestCase):
         later derivation its own earlier output as if it were the owner's."""
         from export_to_sqlite import COUNCIL_BOT_TITLE_PREFIX
         from claude_browser import SCRATCH_TITLE_PREFIX
-        for prefix in (COUNCIL_BOT_TITLE_PREFIX, SCRATCH_TITLE_PREFIX):
+        # The bot producers append a per-question suffix, so they match by
+        # prefix; the discovery appliance always sets one exact name, and is
+        # matched exactly so a real conversation that merely starts with those
+        # words is not swept up with it.
+        titles = [COUNCIL_BOT_TITLE_PREFIX + " 12345",
+                  SCRATCH_TITLE_PREFIX + " 12345",
+                  cb.DISCOVERY_SCRATCH_TITLE]
+        for title in titles:
             manifest = {"entries": [{"source": "claude", "conversation_id": "s",
-                                     "title": prefix + " 12345",
+                                     "title": title,
                                      "created_at": None, "updated_at": None,
                                      "project_id": None, "project_name": None}]}
-            self.assertEqual(cb.pending_entries(manifest, {}), [], prefix)
+            self.assertEqual(cb.pending_entries(manifest, {}), [], title)
+
+    def test_discovery_appliance_scratch_is_excluded(self):
+        """116 of claude.ai's 158 conversations are the discovery appliance's
+        own question traffic; importing them would make machine chatter most of
+        the Claude corpus."""
+        self.assertTrue(cb.is_agent_scratch("discovery scratch"))
+        self.assertTrue(cb.is_agent_scratch("  discovery scratch  "))
+        self.assertFalse(cb.is_agent_scratch("discovery scratchpad ideas"))
 
     def test_ordinary_titles_are_still_queued(self):
         manifest = {"entries": [{"source": "claude", "conversation_id": "s",

@@ -479,25 +479,39 @@ def stored_updated_at(conn):
     }
 
 
+# The `internet` repo's discovery appliance drives claude.ai by creating a
+# conversation with this exact name for every question it asks -- see
+# discovery/providers/claude_chat.py. It lives in a different repo, so the
+# literal is duplicated here rather than imported; it is a stable protocol
+# constant in that provider's request body, not an implementation detail.
+# (Its ChatGPT provider needs no equivalent: that one sets
+# history_and_training_disabled and PATCHes is_visible:false, so its scratch
+# conversations never reach the conversation list at all.)
+DISCOVERY_SCRATCH_TITLE = "discovery scratch"
+
+
 def is_agent_scratch(title):
-    """True if `title` belongs to one of our own agents' throwaway conversations.
+    """True if `title` belongs to one of our own machines' throwaway conversations.
 
-    Two separate producers, both of which create real conversations on the live
-    account that would otherwise import like any other: council_bot.py's
-    per-question scratch conversations, and claude_browser.py's interest
-    extractor. Importing either is a correctness bug, not just noise -- their
-    prompts contain conversation bodies, so a scratch conversation carries the
-    corpus back into the corpus and hands a later derivation its own earlier
-    output as if it were the owner's material. Checked here at the point where
-    work is queued, so such a conversation is never even fetched.
+    Three separate producers, all of which create real conversations on the
+    live account that would otherwise import like any other: council_bot.py's
+    per-question conversations, claude_browser.py's interest extractor, and the
+    discovery appliance's claude.ai provider. Checked where work is queued, so
+    such a conversation is never even fetched.
 
-    Not merely theoretical: an 'interest-extractor scratch' conversation was
-    the first row this backfill imported on 2026-08-18, before this guard
-    existed, and had to be deleted.
+    Importing any of them is a correctness bug rather than noise. The first two
+    carry conversation bodies in their prompts, so they feed a later derivation
+    its own earlier output as if it were the owner's material. The third is
+    worse by volume: 116 of the 158 conversations on claude.ai are 'discovery
+    scratch', i.e. the appliance's own question traffic, so importing them
+    would have made machine chatter roughly three quarters of the Claude corpus
+    and swamped the owner's ~38 real conversations in any interest signal
+    derived from it.
     """
     return bool(title) and (
         is_council_bot_scratch_conversation(title)
         or claude_browser.is_scratch_conversation(title)
+        or title.strip() == DISCOVERY_SCRATCH_TITLE
     )
 
 
